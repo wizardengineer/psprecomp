@@ -79,8 +79,17 @@ FuncPtr RECOMP_LOOKUP(uint32_t vaddr);
 
 // Memory accessors — type-safe rdram access (EMIT-13)
 // Bounds-checked: masked offset + sizeof(T) must fit within 128MB rdram.
+// NULL-page guard (issue #29): checked on the UNMASKED virtual address —
+// scratchpad starts at 0x00010000 and kernel mirrors (0x08000000+) have
+// unmasked values >= 0x00010000, so only genuinely invalid low pointers hit it.
+// PPSSPP-faithful invalid-access semantics: NULL-page reads return 0, writes
+// are discarded — guest code (e.g. Patapon's named-node walks with NULL roots)
+// depends on this.
 template<typename T>
 inline T psp_mem_read(uint8_t* rdram, uint32_t addr) {
+    if (addr < 0x00010000U) {
+        return T{};
+    }
     uint32_t off = addr & 0x07FFFFFFU;
     if (off + sizeof(T) > 0x08000000U) {
         T zero{};
@@ -92,6 +101,9 @@ inline T psp_mem_read(uint8_t* rdram, uint32_t addr) {
 }
 template<typename T>
 inline void psp_mem_write(uint8_t* rdram, uint32_t addr, T val) {
+    if (addr < 0x00010000U) {
+        return;
+    }
     uint32_t off = addr & 0x07FFFFFFU;
     if (off + sizeof(T) > 0x08000000U) {
         return;
@@ -448,6 +460,32 @@ mod tests {
         let union_body = &h[union_start..union_end];
         assert!(union_body.contains("float f[32]"), "f[32] must be inside the union");
         assert!(union_body.contains("uint32_t fi[32]"), "fi[32] must be inside the union");
+    }
+
+    #[test]
+    fn emit_recomp_h_null_page_guard_in_mem_accessors() {
+        // PPSSPP-faithful invalid-access semantics (issue #29): reads from the
+        // NULL page return 0, writes are discarded. Without this, guest code
+        // that walks NULL-rooted trees (Patapon's named-node ctor) writes to
+        // rdram[0], reads it back, and spins forever.
+        let h = CppGenerator::emit_recomp_h();
+        let read_start = h.find("inline T psp_mem_read").expect("psp_mem_read must exist");
+        let read_end = h[read_start..].find("template").expect("read followed by write template")
+            + read_start;
+        let read_body = &h[read_start..read_end];
+        assert!(
+            read_body.contains("if (addr < 0x00010000U)"),
+            "psp_mem_read must guard the unmasked NULL page"
+        );
+        let write_start = h.find("inline void psp_mem_write").expect("psp_mem_write must exist");
+        let write_end =
+            h[write_start..].find("#define MEM_B").expect("MEM_B macros follow write")
+                + write_start;
+        let write_body = &h[write_start..write_end];
+        assert!(
+            write_body.contains("if (addr < 0x00010000U)"),
+            "psp_mem_write must guard the unmasked NULL page"
+        );
     }
 
     #[test]

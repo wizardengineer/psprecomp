@@ -325,21 +325,54 @@ static void hle_sceAtracReinit(
     (void)rdram;
 }
 
+// ATRAC3 frames decode 1024 samples each.
+static constexpr int32_t ATRAC_SAMPLES_PER_FRAME = 1024;
+// Stereo s16 PCM for one frame: 1024 samples * 2 ch * 2 bytes.
+static constexpr uint32_t ATRAC_PCM_BYTES = 4096;
+// Grains of silence before we report the stream finished.
+static constexpr uint32_t ATRAC_FINISH_GRAINS = 512;
+
+/// Zero-fill one frame of PCM at the guest decode buffer (clamped
+/// to guest memory, mirroring sas_zero_output).
+static void atrac_zero_pcm(uint8_t* rdram, uint32_t out_addr) {
+    // NULL-page rejection, consistent with the recomp.h accessor guard.
+    if (out_addr < 0x00010000U) return;
+    uint32_t bytes = ATRAC_PCM_BYTES;
+    uint32_t off = out_addr & PSP_ADDR_MASK;
+    if (off + bytes > PSP_MEM_SIZE) {
+        bytes = static_cast<uint32_t>(PSP_MEM_SIZE) - off;
+    }
+    std::memset(rdram + off, 0, bytes);
+}
+
 static void hle_sceAtracDecodeData(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    // a1 = samples_ptr, a2 = samples_written_ptr,
-    // a3 = end_ptr, stack = remaining_ptr
+    // sceAtracDecodeData(atracID, u16* outPcm, u32* outSamples,
+    //                    u32* outEnd, u32* outRemainFrame)
+    // a0=r[4] id, a1=r[5] pcm, a2=r[6] samples,
+    // a3=r[7] end, t0=r[8] remainFrame (PSP HLE arg 5)
+    uint32_t pcm_ptr = static_cast<uint32_t>(ctx->r[5]);
     uint32_t samples_written_ptr =
         static_cast<uint32_t>(ctx->r[6]);
     uint32_t end_ptr =
         static_cast<uint32_t>(ctx->r[7]);
+    uint32_t remain_ptr = static_cast<uint32_t>(ctx->r[8]);
 
+    atrac_zero_pcm(rdram, pcm_ptr);
     if (samples_written_ptr != 0) {
-        psp_mem_write<int32_t>(rdram, samples_written_ptr, 0);
+        psp_mem_write<int32_t>(
+            rdram, samples_written_ptr, ATRAC_SAMPLES_PER_FRAME);
     }
     if (end_ptr != 0) {
-        psp_mem_write<int32_t>(rdram, end_ptr, 1);  // End reached
+        // Bounded silence: report "not finished" for a while so the
+        // decode worker keeps a sane cadence, then signal end.
+        static uint32_t s_grains = 0;
+        int32_t finished = (++s_grains >= ATRAC_FINISH_GRAINS) ? 1 : 0;
+        psp_mem_write<int32_t>(rdram, end_ptr, finished);
+    }
+    if (remain_ptr != 0) {
+        psp_mem_write<int32_t>(rdram, remain_ptr, -1);
     }
 
     ctx->r[2] = SCE_OK;
@@ -350,7 +383,8 @@ static void hle_sceAtracGetNextSample(
 ) {
     uint32_t out_ptr = static_cast<uint32_t>(ctx->r[5]);
     if (out_ptr != 0) {
-        psp_mem_write<int32_t>(rdram, out_ptr, 0);
+        // ATRAC3 decodes 1024 samples per frame (PPSSPP semantics).
+        psp_mem_write<int32_t>(rdram, out_ptr, ATRAC_SAMPLES_PER_FRAME);
     }
     ctx->r[2] = SCE_OK;
 }
@@ -358,8 +392,24 @@ static void hle_sceAtracGetNextSample(
 static void hle_sceAtracGetStreamDataInfo(
     uint8_t* rdram, recomp_context* ctx
 ) {
+    // sceAtracGetStreamDataInfo(atracID, u8** writePtr,
+    //                           u32* writableBytes, u32* readOffset)
+    // Must write all three out-params: the guest decode worker
+    // otherwise consumes stale stack as writePtr/writableBytes/
+    // readOffset and issues wild reads.
+    uint32_t write_ptr_ptr = static_cast<uint32_t>(ctx->r[5]);
+    uint32_t writable_ptr = static_cast<uint32_t>(ctx->r[6]);
+    uint32_t read_off_ptr = static_cast<uint32_t>(ctx->r[7]);
+    if (write_ptr_ptr != 0) {
+        psp_mem_write<uint32_t>(rdram, write_ptr_ptr, 0);
+    }
+    if (writable_ptr != 0) {
+        psp_mem_write<uint32_t>(rdram, writable_ptr, 0);
+    }
+    if (read_off_ptr != 0) {
+        psp_mem_write<uint32_t>(rdram, read_off_ptr, 0);
+    }
     ctx->r[2] = SCE_OK;
-    (void)rdram;
 }
 
 static void hle_sceAtracAddStreamData(
@@ -381,7 +431,9 @@ static void hle_sceAtracGetRemainFrame(
 ) {
     uint32_t out_ptr = static_cast<uint32_t>(ctx->r[5]);
     if (out_ptr != 0) {
-        psp_mem_write<int32_t>(rdram, out_ptr, 0);
+        // -1 = "all data in memory" (PPSSPP semantics) — tells the
+        // guest it never needs to stream more data in.
+        psp_mem_write<int32_t>(rdram, out_ptr, -1);
     }
     ctx->r[2] = SCE_OK;
 }
