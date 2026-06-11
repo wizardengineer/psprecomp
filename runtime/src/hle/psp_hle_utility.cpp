@@ -1358,63 +1358,213 @@ static void hle_sceUtilityGetSystemParamInt(
     ctx->r[2] = SCE_OK;
 }
 
-// Utility dialog stubs (savedata, msg dialog, OSK, HTML viewer)
-// All return "not running" status (4 = FINISHED/NONE)
+// ---- Utility dialog status protocol (savedata, msg dialog) ----
+// PSP utility dialogs share a status machine (PPSSPP
+// Core/Dialog/PSPDialog.h DialogStatus):
+//   NONE(0) -> InitStart -> INITIALIZE(1) -> RUNNING(2) -> FINISHED(3)
+//   -> ShutdownStart -> SHUTDOWN(4) -> NONE(0)
+// GetStatus auto-advances INITIALIZE->RUNNING and SHUTDOWN->NONE
+// (PPSSPP PSPDialog::GetStatus with UseAutoStatus). We have no dialog
+// UI, so the "dialog" completes instantly: the RUNNING poll performs
+// the work, writes pspUtilityDialogCommon.result (offset +28: u32
+// size, s32 language, s32 buttonSwap, s32 graphics/access/font/sound
+// Thread, s32 result, s32 reserved[4] = 48 bytes), and advances to
+// FINISHED for the next poll.
 static constexpr int32_t PSP_UTILITY_STATUS_NONE = 0;
+static constexpr int32_t PSP_UTILITY_STATUS_INITIALIZE = 1;
+static constexpr int32_t PSP_UTILITY_STATUS_RUNNING = 2;
+static constexpr int32_t PSP_UTILITY_STATUS_FINISHED = 3;
+static constexpr int32_t PSP_UTILITY_STATUS_SHUTDOWN = 4;
+
+// PPSSPP Core/HLE/ErrorCodes.h
+static constexpr uint32_t SCE_ERROR_UTILITY_INVALID_STATUS = 0x80110001U;
+static constexpr uint32_t SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA =
+    0x80110307U;
+static constexpr uint32_t SCE_UTILITY_SAVEDATA_ERROR_RW_NO_DATA =
+    0x80110327U;
+static constexpr uint32_t SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_DATA =
+    0x80110347U;
+static constexpr uint32_t SCE_UTILITY_SAVEDATA_ERROR_SIZES_NO_DATA =
+    0x801103C7U;
+
+// pspUtilityDialogCommon.result offset within the param struct.
+static constexpr uint32_t UTILITY_COMMON_RESULT_OFFSET = 28;
+// SceUtilitySavedataParam.mode immediately follows the 48-byte common
+// header (PPSSPP Core/Dialog/SavedataParam.h).
+static constexpr uint32_t SAVEDATA_MODE_OFFSET = 48;
+
+struct UtilityDialogState {
+    int32_t status = PSP_UTILITY_STATUS_NONE;
+    uint32_t param_addr = 0;
+};
+
+static UtilityDialogState g_savedata_dialog;
+static UtilityDialogState g_msg_dialog;
+
+// We ship no /PSP/SAVEDATA, so every load/read/delete faithfully
+// reports "no data"; save-type modes pretend success (writes out of
+// scope). Mode values: PPSSPP SceUtilitySavedataType.
+static int32_t savedata_completion_result(uint32_t mode) {
+    switch (mode) {
+        case 0:   // AUTOLOAD
+        case 2:   // LOAD
+        case 4:   // LISTLOAD
+            return static_cast<int32_t>(
+                SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA);
+        case 6:   // LISTDELETE
+        case 7:   // LISTALLDELETE
+        case 9:   // AUTODELETE
+        case 10:  // DELETE
+        case 21:  // DELETEDATA
+            return static_cast<int32_t>(
+                SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_DATA);
+        case 8:   // SIZES
+            return static_cast<int32_t>(
+                SCE_UTILITY_SAVEDATA_ERROR_SIZES_NO_DATA);
+        case 15:  // READDATASECURE
+        case 16:  // READDATA
+        case 22:  // GETSIZE
+            return static_cast<int32_t>(
+                SCE_UTILITY_SAVEDATA_ERROR_RW_NO_DATA);
+        default:  // AUTOSAVE/SAVE/LISTSAVE/MAKEDATA/WRITEDATA/...
+            return 0;  // pretend success
+    }
+}
+
+static void utility_dialog_init_start(
+    UtilityDialogState& dlg, recomp_context* ctx
+) {
+    if (dlg.status != PSP_UTILITY_STATUS_NONE) {
+        ctx->r[2] = static_cast<int32_t>(SCE_ERROR_UTILITY_INVALID_STATUS);
+        return;
+    }
+    dlg.param_addr = static_cast<uint32_t>(ctx->r[4]);
+    dlg.status = PSP_UTILITY_STATUS_INITIALIZE;
+    ctx->r[2] = SCE_OK;
+}
+
+// Returns the pre-advance status; performs `complete` (writes the
+// result into the param struct) when leaving RUNNING.
+template <typename CompleteFn>
+static void utility_dialog_get_status(
+    UtilityDialogState& dlg, uint8_t* rdram, recomp_context* ctx,
+    CompleteFn complete
+) {
+    int32_t ret = dlg.status;
+    switch (dlg.status) {
+        case PSP_UTILITY_STATUS_INITIALIZE:
+            dlg.status = PSP_UTILITY_STATUS_RUNNING;
+            break;
+        case PSP_UTILITY_STATUS_RUNNING:
+            complete(dlg, rdram);
+            dlg.status = PSP_UTILITY_STATUS_FINISHED;
+            break;
+        case PSP_UTILITY_STATUS_SHUTDOWN:
+            dlg.status = PSP_UTILITY_STATUS_NONE;
+            dlg.param_addr = 0;
+            break;
+        default:
+            break;
+    }
+    ctx->r[2] = ret;
+}
+
+static void utility_dialog_shutdown_start(
+    UtilityDialogState& dlg, recomp_context* ctx
+) {
+    if (dlg.status != PSP_UTILITY_STATUS_FINISHED) {
+        ctx->r[2] = static_cast<int32_t>(SCE_ERROR_UTILITY_INVALID_STATUS);
+        return;
+    }
+    dlg.status = PSP_UTILITY_STATUS_SHUTDOWN;
+    ctx->r[2] = SCE_OK;
+}
+
+static void utility_dialog_update(
+    UtilityDialogState& dlg, recomp_context* ctx
+) {
+    if (dlg.status != PSP_UTILITY_STATUS_RUNNING) {
+        ctx->r[2] = static_cast<int32_t>(SCE_ERROR_UTILITY_INVALID_STATUS);
+        return;
+    }
+    ctx->r[2] = SCE_OK;
+}
+
+static void savedata_complete(UtilityDialogState& dlg, uint8_t* rdram) {
+    if (dlg.param_addr == 0) {
+        return;
+    }
+    uint32_t mode = psp_mem_read<uint32_t>(
+        rdram, dlg.param_addr + SAVEDATA_MODE_OFFSET);
+    int32_t result = savedata_completion_result(mode);
+    psp_mem_write<int32_t>(
+        rdram, dlg.param_addr + UTILITY_COMMON_RESULT_OFFSET, result);
+    fprintf(stderr,
+            "[HLE] sceUtilitySavedata complete: mode=%u result=0x%08X\n",
+            mode, static_cast<uint32_t>(result));
+}
+
+static void msgdialog_complete(UtilityDialogState& dlg, uint8_t* rdram) {
+    if (dlg.param_addr == 0) {
+        return;
+    }
+    psp_mem_write<int32_t>(
+        rdram, dlg.param_addr + UTILITY_COMMON_RESULT_OFFSET, 0);
+}
 
 static void hle_sceUtilitySavedataInitStart(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = SCE_OK;
+    utility_dialog_init_start(g_savedata_dialog, ctx);
     (void)rdram;
 }
 
 static void hle_sceUtilitySavedataGetStatus(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = PSP_UTILITY_STATUS_NONE;
-    (void)rdram;
+    utility_dialog_get_status(g_savedata_dialog, rdram, ctx,
+                              savedata_complete);
 }
 
 static void hle_sceUtilitySavedataShutdownStart(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = SCE_OK;
+    utility_dialog_shutdown_start(g_savedata_dialog, ctx);
     (void)rdram;
 }
 
 static void hle_sceUtilitySavedataUpdate(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = SCE_OK;
+    utility_dialog_update(g_savedata_dialog, ctx);
     (void)rdram;
 }
 
 static void hle_sceUtilityMsgDialogInitStart(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = SCE_OK;
+    utility_dialog_init_start(g_msg_dialog, ctx);
     (void)rdram;
 }
 
 static void hle_sceUtilityMsgDialogGetStatus(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = PSP_UTILITY_STATUS_NONE;
-    (void)rdram;
+    utility_dialog_get_status(g_msg_dialog, rdram, ctx,
+                              msgdialog_complete);
 }
 
 static void hle_sceUtilityMsgDialogShutdownStart(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = SCE_OK;
+    utility_dialog_shutdown_start(g_msg_dialog, ctx);
     (void)rdram;
 }
 
 static void hle_sceUtilityMsgDialogUpdate(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = SCE_OK;
+    utility_dialog_update(g_msg_dialog, ctx);
     (void)rdram;
 }
 
