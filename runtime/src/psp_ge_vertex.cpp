@@ -379,7 +379,7 @@ static bool ge_view_matrix_all_zero(const GeState& state) {
     if (!warned) {
         warned = true;
         std::fprintf(stderr,
-            "[GE] view matrix all-zero -- identity "
+            "[GE] view matrix all-zero -- NDC-direct "
             "fallback engaged\n");
     }
     return true;
@@ -435,24 +435,31 @@ void ge_transform_vertices(
         // matrices (view all-zero; proj NaN/Inf or malformed
         // diagonal) -- open issue, FPU/VFPU dataflow family.
         // Remove these workarounds when that is fixed.
+        //
+        // Since the issue #27 VFPU register-file fix, the proj
+        // upload is a valid finite ortho, but the view upload is
+        // still all-zero (the guest-side gum view buffer at
+        // ~0x090965B0 is never written -- next divergence layer).
+        // An all-zero view with a valid proj can never render
+        // correctly through the real path (identity-view is a
+        // wrong guess against the 176x100 ortho extents), so an
+        // all-zero view ALSO routes to the NDC-direct mapping.
+        // The full real path engages automatically once the guest
+        // uploads a non-zero view matrix.
         bool view_zero = ge_view_matrix_all_zero(state);
         bool proj_bad = ge_proj_matrix_degenerate(state);
+        bool ndc_direct = view_zero || proj_bad;
 
         for (auto& v : verts) {
             float wpos[3], vpos[3];
             vec3_by_matrix43(state.world_matrix,
                              v.pos, wpos);
-            if (view_zero) {
-                // All-zero view -> treat as identity.
-                vpos[0] = wpos[0];
-                vpos[1] = wpos[1];
-                vpos[2] = wpos[2];
-            } else {
+            if (!ndc_direct) {
                 vec3_by_matrix43(state.view_matrix,
                                  wpos, vpos);
             }
 
-            if (proj_bad) {
+            if (ndc_direct) {
                 // Bypass proj: emit NDC directly from
                 // world-space. This is the ortho mapping
                 // Patapon intends (viewport scale 240/-136,

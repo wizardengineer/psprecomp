@@ -7,34 +7,69 @@
 // Matrix read/write helpers (file-scope, not exposed in header)
 // ---------------------------------------------------------------------------
 
-/// Read a matrix (size x size) into a flat array [row][col].
-static void read_matrix(float out[16], int size, int reg,
+// Physical layout: vfpu[mtx*16 + col*4 + row] (PPSSPP convention; see
+// vfpu_single_index in psp_vfpu.h). Flat matrix arrays here follow
+// PPSSPP's ReadMatrix/WriteMatrix convention: rd[j*4 + i] where j steps
+// along the register's column axis and i along its row axis.
+
+/// Decode the starting row for a size x size matrix register encoding.
+static inline int vfpu_matrix_row(int reg, int size) {
+    switch (size) {
+    case 2:  return (reg >> 5) & 2;
+    case 3:  return (reg >> 6) & 1;
+    case 4:  return (reg >> 5) & 2;
+    default: return (reg >> 5) & 3;  // 1x1
+    }
+}
+
+/// Read a matrix (size x size) into a flat array, PPSSPP ReadMatrix.
+static void read_matrix(float rd[16], int size, int reg,
                         const float vfpu[128]) {
-    for (int row = 0; row < size; row++) {
-        int mtx = (reg >> 2) & 7;
-        int col = reg & 3;
-        int base_row = (reg >> 5) & 2;
-        for (int c = 0; c < size; c++) {
-            int r = (base_row + row) & 3;
-            int cc = (col + c) & 3;
-            out[row * 4 + c] =
-                vfpu[mtx * 16 + r * 4 + cc];
+    int row = vfpu_matrix_row(reg, size);
+    int transpose = (size == 1) ? 0 : ((reg >> 5) & 1);
+    int mtx = (reg >> 2) & 7;
+    int col = reg & 3;
+
+    const float* v = vfpu + mtx * 16;
+    if (transpose) {
+        for (int j = 0; j < size; j++) {
+            for (int i = 0; i < size; i++) {
+                int index = ((row + i) & 3) * 4 + ((col + j) & 3);
+                rd[j * 4 + i] = v[index];
+            }
+        }
+    } else {
+        for (int j = 0; j < size; j++) {
+            for (int i = 0; i < size; i++) {
+                int index = ((col + j) & 3) * 4 + ((row + i) & 3);
+                rd[j * 4 + i] = v[index];
+            }
         }
     }
 }
 
-/// Write a matrix (size x size) from a flat array.
-static void write_matrix(const float in[16], int size, int reg,
+/// Write a matrix (size x size) from a flat array, PPSSPP WriteMatrix.
+static void write_matrix(const float rd[16], int size, int reg,
                          float vfpu[128]) {
+    int row = vfpu_matrix_row(reg, size);
+    int transpose = (size == 1) ? 0 : ((reg >> 5) & 1);
     int mtx = (reg >> 2) & 7;
     int col = reg & 3;
-    int base_row = (reg >> 5) & 2;
-    for (int row = 0; row < size; row++) {
-        for (int c = 0; c < size; c++) {
-            int r = (base_row + row) & 3;
-            int cc = (col + c) & 3;
-            vfpu[mtx * 16 + r * 4 + cc] =
-                in[row * 4 + c];
+
+    float* v = vfpu + mtx * 16;
+    if (transpose) {
+        for (int j = 0; j < size; j++) {
+            for (int i = 0; i < size; i++) {
+                int index = ((row + i) & 3) * 4 + ((col + j) & 3);
+                v[index] = rd[j * 4 + i];
+            }
+        }
+    } else {
+        for (int j = 0; j < size; j++) {
+            for (int i = 0; i < size; i++) {
+                int index = ((col + j) & 3) * 4 + ((row + i) & 3);
+                v[index] = rd[j * 4 + i];
+            }
         }
     }
 }
@@ -70,19 +105,19 @@ static float vfpu_cos_single(float angle) {
 void vfpu_vmmul(recomp_context* ctx, uint8_t*,
                 uint8_t vd, uint8_t vs, uint8_t vt,
                 uint8_t size) {
-    // vmmul rd, vs, vt computes rd = transpose(vs) * vt
-    // CRITICAL: PPSSPP XORs vs with 0x20 to transpose
-    float ms[16], mt[16], md[16];
-    read_matrix(ms, size, vs ^ 0x20, ctx->vfpu);
+    // PPSSPP Int_Vmmul: read vs as-is (transpose is folded into the
+    // summation below), d[a*4+b] = sum_c s[b*4+c] * t[a*4+c].
+    float ms[16] = {}, mt[16] = {}, md[16] = {};
+    read_matrix(ms, size, vs, ctx->vfpu);
     read_matrix(mt, size, vt, ctx->vfpu);
 
-    for (int row = 0; row < size; row++) {
-        for (int col = 0; col < size; col++) {
+    for (int a = 0; a < size; a++) {
+        for (int b = 0; b < size; b++) {
             float sum = 0.0f;
-            for (int k = 0; k < size; k++) {
-                sum += ms[row * 4 + k] * mt[k * 4 + col];
+            for (int c = 0; c < size; c++) {
+                sum += ms[b * 4 + c] * mt[a * 4 + c];
             }
-            md[row * 4 + col] = sum;
+            md[a * 4 + b] = sum;
         }
     }
 

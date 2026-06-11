@@ -7,98 +7,66 @@
 #include <unordered_set>
 
 // ---------------------------------------------------------------------------
-// Register index helpers
+// Register read/write (PPSSPP ReadVector/WriteVector semantics)
+//
+// Physical layout: vfpu[mtx*16 + col*4 + row] (see vfpu_single_index in
+// psp_vfpu.h). Vector access anchors at a fixed column (reg & 3) and
+// iterates rows: stride 1 for column-form (C/non-transpose), stride 4
+// for row-form (R/transpose).
 // ---------------------------------------------------------------------------
 
-/// Compute flat index into vfpu[128] from matrix, row, col.
-/// Layout: vfpu[mtx*16 + row*4 + col]
-static inline int vfpu_reg_index(int mtx, int row, int col) {
-    return mtx * 16 + row * 4 + col;
-}
-
-/// Compute flat index for a single register from 7-bit encoding.
-static inline int vfpu_single_index(int reg) {
-    int mtx = (reg >> 2) & 7;
-    int col = reg & 3;
-    int row = (reg >> 5) & 3;
-    return vfpu_reg_index(mtx, row, col);
+/// Decode the starting row for an n-element vector register encoding.
+static inline int vfpu_vector_row(int reg, int n) {
+    switch (n) {
+    case 2:  return (reg >> 5) & 2;
+    case 3:  return (reg >> 6) & 1;
+    case 4:  return (reg >> 5) & 2;
+    default: return 0;
+    }
 }
 
 void vfpu_read_vector(float* dst, int n, int reg,
                       const float vfpu[128]) {
-    int mtx = (reg >> 2) & 7;
-    int col = reg & 3;
-
     if (n == 1) {
-        int row = (reg >> 5) & 3;
-        dst[0] = vfpu[vfpu_reg_index(mtx, row, col)];
+        dst[0] = vfpu[vfpu_single_index(reg)];
         return;
     }
 
-    int transpose;
-    int row;
-    switch (n) {
-    case 2:
-        row = (reg >> 5) & 2;
-        transpose = (reg >> 5) & 1;
-        break;
-    case 3:
-        row = (reg >> 6) & 1;
-        transpose = (reg >> 5) & 1;
-        break;
-    case 4:
-        row = (reg >> 5) & 2;
-        transpose = (reg >> 5) & 1;
-        break;
-    default:
-        row = 0;
-        transpose = 0;
-        break;
-    }
+    int row = vfpu_vector_row(reg, n);
+    int transpose = (reg >> 5) & 1;
+    int mtx = (reg >> 2) & 7;
+    int col = reg & 3;
 
-    for (int i = 0; i < n; i++) {
-        if (transpose) {
-            dst[i] = vfpu[vfpu_reg_index(mtx, (row + i) & 3, col)];
-        } else {
-            dst[i] = vfpu[vfpu_reg_index(mtx, row, (col + i) & 3)];
+    if (transpose) {
+        // Row form: fixed row anchor (col here selects the row slot),
+        // step across columns -> stride 4 in physical layout.
+        const int base = mtx * 16 + col;
+        for (int i = 0; i < n; i++) {
+            dst[i] = vfpu[base + ((row + i) & 3) * 4];
+        }
+    } else {
+        // Column form: fixed column, step down rows -> stride 1.
+        const int base = mtx * 16 + col * 4;
+        for (int i = 0; i < n; i++) {
+            dst[i] = vfpu[base + ((row + i) & 3)];
         }
     }
 }
 
 void vfpu_write_vector(const float* src, int n, int reg,
                        float vfpu[128], uint32_t dprefix) {
-    int mtx = (reg >> 2) & 7;
-    int col = reg & 3;
-
     if (n == 1) {
         // Write mask for single: bit 8
         if (!((dprefix >> 8) & 1)) {
-            int row = (reg >> 5) & 3;
-            vfpu[vfpu_reg_index(mtx, row, col)] = src[0];
+            vfpu[vfpu_single_index(reg)] = src[0];
         }
         return;
     }
 
-    int transpose;
-    int row;
-    switch (n) {
-    case 2:
-        row = (reg >> 5) & 2;
-        transpose = (reg >> 5) & 1;
-        break;
-    case 3:
-        row = (reg >> 6) & 1;
-        transpose = (reg >> 5) & 1;
-        break;
-    case 4:
-        row = (reg >> 5) & 2;
-        transpose = (reg >> 5) & 1;
-        break;
-    default:
-        row = 0;
-        transpose = 0;
-        break;
-    }
+    int row = vfpu_vector_row(reg, n);
+    int transpose = (reg >> 5) & 1;
+    int mtx = (reg >> 2) & 7;
+    int col = reg & 3;
 
     for (int i = 0; i < n; i++) {
         // Check write mask: bit (8+i) of dprefix
@@ -107,9 +75,9 @@ void vfpu_write_vector(const float* src, int n, int reg,
         }
         int idx;
         if (transpose) {
-            idx = vfpu_reg_index(mtx, (row + i) & 3, col);
+            idx = mtx * 16 + col + ((row + i) & 3) * 4;
         } else {
-            idx = vfpu_reg_index(mtx, row, (col + i) & 3);
+            idx = mtx * 16 + col * 4 + ((row + i) & 3);
         }
         vfpu[idx] = src[i];
     }

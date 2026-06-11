@@ -2,16 +2,8 @@
 #include "recomp.h"
 #include <cstring>
 
-// ---------------------------------------------------------------------------
-// Register index helper for single registers
-// ---------------------------------------------------------------------------
-
-static inline int vfpu_single_index_local(int reg) {
-    int mtx = (reg >> 2) & 7;
-    int col = reg & 3;
-    int row = (reg >> 5) & 3;
-    return mtx * 16 + row * 4 + col;
-}
+// Single-register flat index comes from the shared vfpu_single_index()
+// inline in psp_vfpu.h (layout: vfpu[mtx*16 + col*4 + row]).
 
 // ---------------------------------------------------------------------------
 // Memory load/store operations
@@ -23,7 +15,7 @@ void vfpu_lv_s(recomp_context* ctx, uint8_t* rdram,
     uint32_t addr =
         static_cast<uint32_t>(ctx->r[rs]) + offset;
     float val = psp_mem_read<float>(rdram, addr);
-    int idx = vfpu_single_index_local(vt);
+    int idx = vfpu_single_index(vt);
     ctx->vfpu[idx] = val;
 }
 
@@ -31,7 +23,7 @@ void vfpu_sv_s(recomp_context* ctx, uint8_t* rdram,
                uint8_t vt, uint8_t rs, int16_t offset) {
     uint32_t addr =
         static_cast<uint32_t>(ctx->r[rs]) + offset;
-    int idx = vfpu_single_index_local(vt);
+    int idx = vfpu_single_index(vt);
     psp_mem_write<float>(rdram, addr, ctx->vfpu[idx]);
 }
 

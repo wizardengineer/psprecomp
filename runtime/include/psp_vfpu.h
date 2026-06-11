@@ -25,6 +25,19 @@ constexpr int VFPU_CTRL_RCX7 = 15;
 // ---------------------------------------------------------------------------
 // Register helpers
 // ---------------------------------------------------------------------------
+
+/// Physical register-file layout follows PPSSPP's convention:
+///   vfpu[mtx * 16 + col * 4 + row]
+/// i.e. each matrix is stored column-major in the flat array.
+/// This single helper is shared by all VFPU translation units so the
+/// layout choice stays encapsulated in one place.
+inline int vfpu_single_index(int reg) {
+    int mtx = (reg >> 2) & 7;
+    int col = reg & 3;
+    int row = (reg >> 5) & 3;
+    return mtx * 16 + col * 4 + row;
+}
+
 void vfpu_read_vector(float* dst, int n, int reg,
                       const float vfpu[128]);
 void vfpu_write_vector(const float* src, int n, int reg,
