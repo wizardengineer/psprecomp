@@ -165,6 +165,9 @@ void psp_hle_register_power();
 void psp_hle_register_ctrl();
 void psp_hle_register_utility();
 
+// SAS voice state machine (issue #29)
+void psp_hle_register_sas();
+
 // ---- Phase 11.2 wrapper consolidation (Pattern F / FORM 2) ----
 // Forward declaration of the GE-gatekeeper fixup body originally defined in
 // runtime/src/hle/psp_hle_kernel_memory.cpp. The function performs the

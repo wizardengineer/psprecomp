@@ -45,6 +45,7 @@ set(RUNTIME_SOURCES
     src/hle/psp_hle_power.cpp
     src/hle/psp_hle_ctrl.cpp
     src/hle/psp_hle_utility.cpp
+    src/hle/psp_hle_sas.cpp
     src/psp_vfpu_core.cpp
     src/psp_vfpu_arith.cpp
     src/psp_vfpu_trig.cpp

@@ -456,4 +456,7 @@ void psp_hle_register_all_modules() {
     psp_hle_register_power();
     psp_hle_register_ctrl();
     psp_hle_register_utility();
+
+    // SAS voice state machine (issue #29)
+    psp_hle_register_sas();
 }

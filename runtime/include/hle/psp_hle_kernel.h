@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <chrono>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <unordered_map>
@@ -17,6 +19,15 @@ struct PspThreadInfo {
 };
 
 // ---- Semaphore ----
+
+/// FIFO wait-queue entry for sceKernelWaitSema. Stack-allocated by the
+/// waiting thread; the signaller transfers the count directly to the
+/// waiter (granted=true) so polling threads cannot steal it (issue #29).
+struct SemaWaiter {
+    int need;            // signal count this waiter requires
+    bool granted;        // set true by SignalSema after count transfer
+};
+
 struct PspSemaphore {
     int uid;
     char name[32];
@@ -25,6 +36,8 @@ struct PspSemaphore {
     int init_count;
     int wait_count = 0;
     bool deleted = false;
+    std::deque<SemaWaiter*> waiters;  // FIFO; guarded by mtx
+    std::chrono::steady_clock::time_point last_stuck_warn{};
     std::mutex mtx;
     std::condition_variable cv;
 };

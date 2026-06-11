@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <ctime>
 #include <chrono>
+#include <thread>
 #include <vector>
 
 // ================================================================
@@ -150,31 +151,76 @@ static void hle_sceKernelLibcGettimeofday(
     ctx->r[2] = SCE_OK;
 }
 
-// ---- Audio (no-ops for now; Phase 5+ will implement) ----
+// ---- Audio (timing only; no rendering yet) ----
+// Issue #29: the *Blocking output calls must pace the caller at the
+// hardware playback rate (44.1kHz). Returning instantly made the PCM
+// loop spin at kHz, starving everything else.
+
+static constexpr int AUDIO_OUTPUT_SAMPLE_RATE = 44100;
+static constexpr int AUDIO_CHANNEL_COUNT = 8;
+// Valid PSP sample counts: 17..4111 (sceAudioOutput2Reserve contract).
+static constexpr int AUDIO_MIN_SAMPLES = 17;
+static constexpr int AUDIO_MAX_SAMPLES = 4111;
+
+// Sample count from sceAudioOutput2Reserve (default one 1024 grain
+// if Reserve was never seen).
+static int g_output2_samples = 1024;
+// Per-channel sample counts from sceAudioChReserve.
+static int g_channel_samples[AUDIO_CHANNEL_COUNT] = {
+    1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024,
+};
+
+/// Block the calling thread for the playback duration of `samples`
+/// samples at 44.1kHz. Mirrors the hle_sceKernelDelayThread blocking
+/// idiom (psp_hle_kernel_thread.cpp): dispatch pending IO callbacks,
+/// yield, then sleep.
+static void audio_block_for_samples(
+    uint8_t* rdram, recomp_context* ctx, int64_t samples
+) {
+    psp_kernel_check_callbacks(rdram, ctx);
+    sched_yield_point();
+    std::this_thread::sleep_for(std::chrono::microseconds(
+        samples * 1000000LL / AUDIO_OUTPUT_SAMPLE_RATE));
+}
 
 static void hle_sceAudioOutputBlocking(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    // Return sample count (a1) to indicate "played"
-    sched_yield_point();
-    ctx->r[2] = ctx->r[5];
-    (void)rdram;
+    uint32_t channel = static_cast<uint32_t>(ctx->r[4]);
+    // Preserve existing return convention (a1) before callbacks can
+    // clobber argument registers.
+    int32_t ret = ctx->r[5];
+    int samples = (channel < AUDIO_CHANNEL_COUNT)
+        ? g_channel_samples[channel] : 1024;
+    audio_block_for_samples(rdram, ctx, samples);
+    ctx->r[2] = ret;
 }
 
 static void hle_sceAudioOutputPannedBlocking(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    sched_yield_point();
-    // Return sample count (a3 for panned variant)
-    ctx->r[2] = ctx->r[7];
-    (void)rdram;
+    uint32_t channel = static_cast<uint32_t>(ctx->r[4]);
+    // Preserve existing return convention (a3) before callbacks can
+    // clobber argument registers.
+    int32_t ret = ctx->r[7];
+    int samples = (channel < AUDIO_CHANNEL_COUNT)
+        ? g_channel_samples[channel] : 1024;
+    audio_block_for_samples(rdram, ctx, samples);
+    ctx->r[2] = ret;
 }
 
 static void hle_sceAudioChReserve(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    // Return channel 0
-    ctx->r[2] = 0;
+    int32_t channel = ctx->r[4];
+    int32_t samples = ctx->r[5];
+    if (channel < 0 || channel >= AUDIO_CHANNEL_COUNT) {
+        channel = 0;  // auto-allocate / out-of-range: use channel 0
+    }
+    if (samples >= AUDIO_MIN_SAMPLES && samples <= AUDIO_MAX_SAMPLES) {
+        g_channel_samples[channel] = samples;
+    }
+    ctx->r[2] = channel;
     (void)rdram;
 }
 
@@ -188,6 +234,10 @@ static void hle_sceAudioChRelease(
 static void hle_sceAudioOutput2Reserve(
     uint8_t* rdram, recomp_context* ctx
 ) {
+    int32_t samples = ctx->r[4] & 0x7FFFFFFF;
+    if (samples >= AUDIO_MIN_SAMPLES && samples <= AUDIO_MAX_SAMPLES) {
+        g_output2_samples = samples;
+    }
     ctx->r[2] = SCE_OK;
     (void)rdram;
 }
@@ -195,9 +245,10 @@ static void hle_sceAudioOutput2Reserve(
 static void hle_sceAudioOutput2OutputBlocking(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    sched_yield_point();
+    // a0=vol, a1=buf. buf==0 is the pre-Release drain: sleep one grain
+    // and report success, same as a normal grain.
+    audio_block_for_samples(rdram, ctx, g_output2_samples);
     ctx->r[2] = SCE_OK;
-    (void)rdram;
 }
 
 static void hle_sceAudioOutput2Release(
@@ -1091,14 +1142,7 @@ static void hle_scePsmfGetNumberOfStreams(
 }
 
 // ---- SAS (Software Audio Synthesis) ----
-// All SAS stubs return SCE_OK. Phase 5+ will implement audio.
-
-static void hle_sas_noop(
-    uint8_t* rdram, recomp_context* ctx
-) {
-    ctx->r[2] = SCE_OK;
-    (void)rdram;
-}
+// Moved to psp_hle_sas.cpp (issue #29: minimal voice state machine).
 
 // ---- Stdio ----
 
@@ -1617,35 +1661,8 @@ void psp_hle_register_utility() {
     psp_hle_register("scePsmfGetNumberOfStreams",
                       hle_scePsmfGetNumberOfStreams);
 
-    // SAS (Software Audio Synthesis) - all share no-op handler
-    psp_hle_register("__sceSasInit", hle_sas_noop);
-    psp_hle_register("__sceSasCore", hle_sas_noop);
-    psp_hle_register("__sceSasCoreWithMix", hle_sas_noop);
-    psp_hle_register("__sceSasSetVoice", hle_sas_noop);
-    psp_hle_register("__sceSasSetVolume", hle_sas_noop);
-    psp_hle_register("__sceSasSetPitch", hle_sas_noop);
-    psp_hle_register("__sceSasSetKeyOn", hle_sas_noop);
-    psp_hle_register("__sceSasSetKeyOff", hle_sas_noop);
-    psp_hle_register("__sceSasSetPause", hle_sas_noop);
-    psp_hle_register("__sceSasSetADSR", hle_sas_noop);
-    psp_hle_register("__sceSasSetADSRmode", hle_sas_noop);
-    psp_hle_register("__sceSasSetSL", hle_sas_noop);
-    psp_hle_register("__sceSasSetSimpleADSR", hle_sas_noop);
-    psp_hle_register("__sceSasSetNoise", hle_sas_noop);
-    psp_hle_register("__sceSasSetGrain", hle_sas_noop);
-    psp_hle_register("__sceSasGetGrain", hle_sas_noop);
-    psp_hle_register("__sceSasRevParam", hle_sas_noop);
-    psp_hle_register("__sceSasRevType", hle_sas_noop);
-    psp_hle_register("__sceSasRevEVOL", hle_sas_noop);
-    psp_hle_register("__sceSasRevVON", hle_sas_noop);
-    psp_hle_register("__sceSasGetEndFlag", hle_sas_noop);
-    psp_hle_register("__sceSasGetEnvelopeHeight",
-                      hle_sas_noop);
-    psp_hle_register("__sceSasGetAllEnvelopeHeights",
-                      hle_sas_noop);
-    psp_hle_register("__sceSasGetPauseFlag", hle_sas_noop);
-    psp_hle_register("__sceSasGetOutputmode", hle_sas_noop);
-    psp_hle_register("__sceSasSetOutputmode", hle_sas_noop);
+    // SAS (Software Audio Synthesis) -- see psp_hle_sas.cpp
+    // (registered by psp_hle_register_sas()).
 
     // Stdio
     psp_hle_register("sceKernelStdin", hle_sceKernelStdin);

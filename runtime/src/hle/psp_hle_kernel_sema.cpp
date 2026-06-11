@@ -5,6 +5,7 @@
 #include "recomp.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -13,6 +14,63 @@
 #include <thread>
 
 static std::unordered_map<int, std::unique_ptr<PspSemaphore>> g_semaphores;
+
+// ---- Debug trace gating ----
+// The per-call WaitSema/Signal logs produced ~1GB/min during stalls.
+// Gate them behind PSPRECOMP_SEMA_TRACE=1 (getenv cached once, matching
+// the PSPRECOMP_HLE_TRACE pattern in psp_hle_dispatch.cpp).
+static bool sema_trace_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("PSPRECOMP_SEMA_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+// ---- FIFO waiter handoff helpers (issue #29) ----
+// SignalSema transfers the count directly to queued waiters in FIFO
+// order (PPSSPP-equivalent direct handoff; FIFO is correct for the
+// attr=0 semaphores Patapon creates). Without this, the polling main
+// thread steals the count every time and the PCM thread starves
+// forever on 'sgx-psp-sas-attrsema'.
+
+/// Drain the FIFO wait queue: transfer count to waiters in order while
+/// it suffices, then wake everyone. Caller must hold s.mtx.
+static void sema_grant_waiters(PspSemaphore& s) {
+    while (!s.waiters.empty()
+           && s.current_count >= s.waiters.front()->need) {
+        SemaWaiter* w = s.waiters.front();
+        s.current_count -= w->need;
+        w->granted = true;
+        s.waiters.pop_front();
+    }
+    s.cv.notify_all();
+}
+
+/// Remove a (non-granted) waiter from the queue, e.g. on timeout or
+/// shutdown. Caller must hold s.mtx.
+static void sema_remove_waiter(PspSemaphore& s, SemaWaiter* w) {
+    for (auto it = s.waiters.begin(); it != s.waiters.end(); ++it) {
+        if (*it == w) {
+            s.waiters.erase(it);
+            return;
+        }
+    }
+}
+
+/// STUCK warning, rate-limited to once per uid per 30s.
+/// Caller must hold s.mtx.
+static void sema_warn_stuck(PspSemaphore& s, int uid, int32_t signal) {
+    auto now = std::chrono::steady_clock::now();
+    if (now - s.last_stuck_warn < std::chrono::seconds(30)) {
+        return;
+    }
+    s.last_stuck_warn = now;
+    std::fprintf(stderr,
+        "[HLE] sceKernelWaitSema STUCK: uid=%d '%s' "
+        "count=%d signal=%d (still waiting)\n",
+        uid, s.name, s.current_count, signal);
+}
 
 // ---- HLE Functions ----
 
@@ -72,7 +130,7 @@ static void hle_sceKernelSignalSema(
     int32_t signal = ctx->r[5];
 
     // Trace all direct Signal(259) calls to find the source
-    if (uid == 259) {
+    if (uid == 259 && sema_trace_enabled()) {
         static int direct_count = 0;
         direct_count++;
         if (direct_count <= 30) {
@@ -149,15 +207,20 @@ static void hle_sceKernelSignalSema(
     }
 
     s->current_count += signal;
-    s->cv.notify_all();
 
-    // Log sema 271 signals to trace completion pipelines
-    if (uid == 271) {
+    // Log sema 271 signals to trace completion pipelines.
+    // (Before the handoff drain so the logged count is the post-signal,
+    // pre-transfer value.)
+    if (uid == 271 && sema_trace_enabled()) {
         std::fprintf(stderr,
             "[SEMA271] Signal count=%d->%d caller=0x%08X\n",
             s->current_count - signal, s->current_count,
             g_last_func_addr);
     }
+
+    // Direct handoff: transfer the count to queued waiters (FIFO),
+    // then wake everyone (issue #29).
+    sema_grant_waiters(*s);
 
     ctx->r[2] = SCE_OK;
     (void)rdram;
@@ -205,7 +268,8 @@ static void hle_sceKernelWaitSema(
         s->wait_count++;
         bool got_it = s->cv.wait_for(lock,
             std::chrono::milliseconds(100),
-            [&] { return s->current_count >= signal; });
+            [&] { return s->current_count >= signal
+                         && s->waiters.empty(); });
         if (got_it) {
             s->current_count -= signal;
         }
@@ -214,7 +278,7 @@ static void hle_sceKernelWaitSema(
         return;
     }
 
-    if (uid == 259) {
+    if (uid == 259 && sema_trace_enabled()) {
         static int wait259_count = 0;
         wait259_count++;
         if (wait259_count <= 30) {
@@ -224,20 +288,40 @@ static void hle_sceKernelWaitSema(
                 s->current_count, signal);
         }
     }
-    std::fprintf(stderr,
-        "[HLE] sceKernelWaitSema(uid=%d '%s' count=%d signal=%d)\n",
-        uid, s->name, s->current_count, signal);
+    if (sema_trace_enabled()) {
+        std::fprintf(stderr,
+            "[HLE] sceKernelWaitSema(uid=%d '%s' count=%d signal=%d)\n",
+            uid, s->name, s->current_count, signal);
+    }
 
     std::unique_lock<std::mutex> lock(s->mtx);
+
+    // Fast path: take immediately ONLY if no one is queued ahead of us
+    // (no queue jumping -- preserves FIFO fairness, issue #29).
+    if (s->current_count >= signal && s->waiters.empty()) {
+        s->current_count -= signal;
+        ctx->r[2] = SCE_OK;
+        return;
+    }
+
+    // Slow path: enqueue a stack-allocated waiter. SignalSema transfers
+    // the count to us directly (granted=true), so on the granted path we
+    // must NOT decrement current_count again.
+    SemaWaiter waiter{signal, false};
+    s->waiters.push_back(&waiter);
 
     s->wait_count++;
     if (timeout_ptr != 0) {
         uint32_t timeout_us = psp_mem_read<uint32_t>(
             rdram, timeout_ptr);
         auto timeout = std::chrono::microseconds(timeout_us);
-        if (!s->cv.wait_for(lock, timeout,
-            [&] { return s->current_count >= signal
-                         || g_should_exit.load(); })) {
+        s->cv.wait_for(lock, timeout,
+            [&] { return waiter.granted || g_should_exit.load(); });
+        if (!waiter.granted) {
+            // Timed out (or shutting down): remove our own waiter.
+            // If granted flipped during the race, it was already popped
+            // by the signaller and we fall through as acquired.
+            sema_remove_waiter(*s, &waiter);
             s->wait_count--;
             ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
             return;
@@ -245,28 +329,26 @@ static void hle_sceKernelWaitSema(
     } else {
         // Unbounded wait: 5-second safety valve + g_should_exit escape
         // so threads can be cleaned up on shutdown.
-        while (s->current_count < signal && !g_should_exit.load()) {
+        while (!waiter.granted && !g_should_exit.load()) {
             s->cv.wait_for(lock, std::chrono::seconds(5),
-                [&] { return s->current_count >= signal
-                             || g_should_exit.load(); });
-            if (s->current_count < signal && !g_should_exit.load()) {
-                std::fprintf(stderr,
-                    "[HLE] sceKernelWaitSema STUCK: uid=%d '%s' "
-                    "count=%d signal=%d (still waiting)\n",
-                    uid, s->name, s->current_count, signal);
+                [&] { return waiter.granted || g_should_exit.load(); });
+            if (!waiter.granted && !g_should_exit.load()) {
+                sema_warn_stuck(*s, uid, signal);
             }
+        }
+        if (!waiter.granted) {
+            // g_should_exit: bail without consuming the resource.
+            sema_remove_waiter(*s, &waiter);
+            s->wait_count--;
+            ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+            return;
         }
     }
     s->wait_count--;
 
-    // Only decrement count if we actually acquired the semaphore.
-    // On g_should_exit, we bail without consuming the resource.
-    if (g_should_exit.load() && s->current_count < signal) {
-        ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-        return;
-    }
-    s->current_count -= signal;
-    if (uid == 271) {
+    // Granted: the signaller already transferred the count to us --
+    // do NOT decrement current_count here.
+    if (uid == 271 && sema_trace_enabled()) {
         std::fprintf(stderr,
             "[SEMA271] WaitSema acquired count_after=%d caller=0x%08X\n",
             s->current_count, g_last_func_addr);
@@ -324,9 +406,11 @@ static void hle_sceKernelWaitSemaCB(
         // 2+3. Try to acquire under mutex; if not available, cv.wait_for
         {
             std::unique_lock<std::mutex> lock(s->mtx);
-            if (s->current_count >= signal) {
+            // No queue jumping: only acquire if no waiter is queued
+            // ahead of us (issue #29 FIFO handoff).
+            if (s->current_count >= signal && s->waiters.empty()) {
                 s->current_count -= signal;
-                if (uid == 271) {
+                if (uid == 271 && sema_trace_enabled()) {
                     std::fprintf(stderr,
                         "[SEMA271] WaitSemaCB acquired count_after=%d "
                         "caller=0x%08X\n",
@@ -341,7 +425,8 @@ static void hle_sceKernelWaitSemaCB(
             // SignalSema — much faster than sleep_for.
             s->wait_count++;
             s->cv.wait_for(lock, std::chrono::milliseconds(5),
-                [&] { return s->current_count >= signal
+                [&] { return (s->current_count >= signal
+                              && s->waiters.empty())
                              || g_should_exit.load(); });
             s->wait_count--;
             // Do NOT decrement here — re-check at top of loop
@@ -388,7 +473,9 @@ static void hle_sceKernelPollSema(
     }
     std::unique_lock<std::mutex> lock(s->mtx);
 
-    if (s->current_count >= signal) {
+    // No queue jumping: a poller must not steal the count from queued
+    // waiters (issue #29 FIFO handoff).
+    if (s->current_count >= signal && s->waiters.empty()) {
         s->current_count -= signal;
         ctx->r[2] = SCE_OK;
     } else {
@@ -432,7 +519,8 @@ void psp_hle_signal_sema_by_uid(int uid, int count) {
     auto& s = it->second;
     std::unique_lock<std::mutex> lock(s->mtx);
     s->current_count += count;
-    s->cv.notify_all();
+    // Same direct handoff as SignalSema (issue #29).
+    sema_grant_waiters(*s);
 }
 
 // ---- Registration ----
