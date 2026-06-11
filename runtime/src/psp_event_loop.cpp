@@ -15,6 +15,53 @@
 std::atomic<bool> g_should_exit{false};
 std::atomic<int>  g_alive_threads{0};
 std::thread::id   g_main_thread_id;
+std::atomic<uint32_t> g_host_buttons{0};
+
+// ---------------------------------------------------------------------------
+// Keyboard -> PSP button mapping
+//   Arrows -> D-pad | X / Enter -> CROSS | Z -> CIRCLE | A -> SQUARE
+//   S -> TRIANGLE   | Q -> LTRIGGER     | W -> RTRIGGER
+//   Space -> START  | Tab -> SELECT
+// ---------------------------------------------------------------------------
+static uint32_t key_to_psp_button(SDL_Keycode key) {
+    switch (key) {
+        case SDLK_UP:     return 0x0010;  // UP
+        case SDLK_RIGHT:  return 0x0020;  // RIGHT
+        case SDLK_DOWN:   return 0x0040;  // DOWN
+        case SDLK_LEFT:   return 0x0080;  // LEFT
+        case SDLK_x:
+        case SDLK_RETURN: return 0x4000;  // CROSS
+        case SDLK_z:      return 0x2000;  // CIRCLE
+        case SDLK_a:      return 0x8000;  // SQUARE
+        case SDLK_s:      return 0x1000;  // TRIANGLE
+        case SDLK_q:      return 0x0100;  // LTRIGGER
+        case SDLK_w:      return 0x0200;  // RTRIGGER
+        case SDLK_SPACE:  return 0x0008;  // START
+        case SDLK_TAB:    return 0x0001;  // SELECT
+        default:          return 0;
+    }
+}
+
+// Handle one SDL event: window close + keyboard button state.
+static void handle_sdl_event(const SDL_Event& ev) {
+    if (ev.type == SDL_QUIT) {
+        g_should_exit.store(true);
+    } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+        if (ev.key.repeat) return;  // ignore OS key repeat
+        uint32_t bit = key_to_psp_button(ev.key.keysym.sym);
+        if (bit == 0) return;
+        if (ev.type == SDL_KEYDOWN) {
+            g_host_buttons.fetch_or(bit, std::memory_order_relaxed);
+        } else {
+            g_host_buttons.fetch_and(~bit, std::memory_order_relaxed);
+        }
+    } else if (ev.type == SDL_WINDOWEVENT &&
+               ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+        // KEYUP is not delivered after focus loss; release everything
+        // so no button sticks.
+        g_host_buttons.store(0, std::memory_order_relaxed);
+    }
+}
 
 // --- Static state (SDL window + GL context, module-private) ---
 static SDL_Window*  g_window     = nullptr;
@@ -97,12 +144,10 @@ void psp_event_loop(uint8_t* rdram) {
     (void)rdram;  // Currently unused; Phase 5 may need it
 
     while (!g_should_exit.load()) {
-        // 1. Pump SDL events (window close, input, etc.)
+        // 1. Pump SDL events (window close, keyboard input)
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) {
-                g_should_exit.store(true);
-            }
+            handle_sdl_event(ev);
         }
 
         // 2. Drain render queue — execute pending GL work from game threads
@@ -118,9 +163,7 @@ void psp_event_loop(uint8_t* rdram) {
                    && !g_should_exit.load()) {
                 SDL_Event ev;
                 while (SDL_PollEvent(&ev)) {
-                    if (ev.type == SDL_QUIT) {
-                        g_should_exit.store(true);
-                    }
+                    handle_sdl_event(ev);
                 }
                 render_queue_process();
                 SDL_Delay(16);  // ~60fps drain rate

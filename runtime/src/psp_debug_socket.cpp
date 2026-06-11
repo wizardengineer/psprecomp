@@ -1,6 +1,8 @@
 #include "psp_debug_socket.h"
+#include "psp_runtime.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +23,11 @@ static int                g_server_fd = -1;
 static uint8_t* g_rdram      = nullptr;
 static size_t   g_rdram_size = 0;
 
+// Injected button overlay (declared extern in psp_runtime.h).
+// Set by the B command below; consumed by the sceCtrl HLE.
+std::atomic<uint32_t> g_injected_buttons{0};
+std::atomic<int64_t>  g_injected_buttons_deadline_ms{0};
+
 /// Handle one connected client: read lines, serve R commands.
 /// Returns when the client disconnects or the server is shutting down.
 static void handle_client(int client_fd) {
@@ -39,7 +46,38 @@ static void handle_client(int client_fd) {
             line[pos] = '\0';
             pos = 0;
 
-            // Parse: R <hex_addr> <decimal_size>
+            // Protocol (one command per line):
+            //   R <hex_addr> <decimal_size>  -- read PSP memory, replies
+            //                                   with <size> raw bytes
+            //   B <hex_mask> <decimal_ms>    -- inject PSP button mask for
+            //                                   <ms> milliseconds (no reply)
+            if (line[0] == 'B' && line[1] == ' ') {
+                char* end = nullptr;
+                unsigned long mask = std::strtoul(line + 2, &end, 16);
+                unsigned long hold_ms = 0;
+                if (end && *end == ' ') {
+                    hold_ms = std::strtoul(end + 1, nullptr, 10);
+                }
+                // Clamp: bounds how long an injected press can stick
+                // and keeps the deadline math overflow-free.
+                if (hold_ms > 60000) {
+                    hold_ms = 60000;
+                }
+                if (hold_ms > 0) {
+                    auto now_ms = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now()
+                                .time_since_epoch()).count();
+                    g_injected_buttons.store(
+                        static_cast<uint32_t>(mask),
+                        std::memory_order_relaxed);
+                    g_injected_buttons_deadline_ms.store(
+                        now_ms + static_cast<int64_t>(hold_ms),
+                        std::memory_order_relaxed);
+                }
+                continue;
+            }
+
             unsigned long addr_raw = 0;
             unsigned long read_size = 0;
             if (line[0] == 'R' && line[1] == ' ') {

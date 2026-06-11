@@ -1,4 +1,5 @@
 #include "hle/psp_hle.h"
+#include "psp_runtime.h"
 #include "psp_scheduler.h"
 #include "psp_memory.h"
 #include "recomp.h"
@@ -25,8 +26,19 @@ static void write_ctrl_data(
     psp_mem_write<uint32_t>(rdram, ptr,
         static_cast<uint32_t>(us & 0xFFFFFFFF));
 
-    // Buttons: 0 (nothing pressed)
-    psp_mem_write<uint32_t>(rdram, ptr + 4, 0);
+    // Buttons: host keyboard mask OR debug-socket injected mask
+    // (injected mask only while its deadline has not expired).
+    uint32_t buttons =
+        g_host_buttons.load(std::memory_order_relaxed);
+    auto now_ms = std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+    if (now_ms < g_injected_buttons_deadline_ms.load(
+            std::memory_order_relaxed)) {
+        buttons |= g_injected_buttons.load(
+            std::memory_order_relaxed);
+    }
+    psp_mem_write<uint32_t>(rdram, ptr + 4, buttons);
 
     // Analog stick: center (128, 128)
     psp_mem_write<uint8_t>(rdram, ptr + 8, 128);
