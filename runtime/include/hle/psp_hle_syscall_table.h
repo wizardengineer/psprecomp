@@ -61,7 +61,7 @@ static const PspNidStubEntry PSP_NID_STUBS[] = {
     { 0x089D7668U, 0xCEADEB47U, "sceKernelDelayThread", "ThreadManForUser" },
     { 0x089D7670U, 0x1FB15A32U, "sceKernelSetEventFlag", "ThreadManForUser" },
     { 0x089D7678U, 0xD6DA4BA1U, "sceKernelCreateSema", "ThreadManForUser" },     // FIXED: NID=0xD6DA4BA1 IS sceKernelCreateSema (was wrongly "sceKernelDeleteEventFlag")
-    { 0x089D7680U, 0xDF52098FU, "sceKernelCancelEventFlag", "ThreadManForUser" }, // FIXED: NID=0xDF52098F IS sceKernelCancelEventFlag (was wrongly "sceKernelClearEventFlag")
+    { 0x089D7680U, 0xDF52098FU, "sceKernelTryReceiveMsgPipe", "ThreadManForUser" }, // FIXED: NID=0xDF52098F IS sceKernelTryReceiveMsgPipe (PPSSPP sceKernelMsgPipe.cpp; CancelEventFlag is 0xCD203292)
     { 0x089D7688U, 0xE81CAF8FU, "sceKernelCreateCallback", "ThreadManForUser" },
     { 0x089D7690U, 0xEA748E31U, "sceKernelChangeCurrentThreadAttr", "ThreadManForUser" },
     { 0x089D7698U, 0xEDBA5844U, "sceKernelDeleteCallback", "ThreadManForUser" },

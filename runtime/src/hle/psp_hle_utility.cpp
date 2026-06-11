@@ -1,15 +1,20 @@
 #include "hle/psp_hle.h"
 #include "hle/psp_hle_kernel.h"
 #include "psp_memory.h"
+#include "psp_runtime.h"
 #include "psp_scheduler.h"
 #include "recomp.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <strings.h>
 #include <ctime>
 #include <chrono>
+#include <deque>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // ================================================================
@@ -1625,37 +1630,145 @@ static void hle_sceUtilityHtmlViewerUpdate(
 }
 
 // ---- MsgPipe (Kernel message pipes) ----
+// PSP MsgPipes are byte streams with no message boundaries
+// (PPSSPP Core/HLE/sceKernelMsgPipe.cpp semantics). Patapon's
+// sound-stream manager runs a command bus over one: the main
+// thread Sends 84-byte commands, the sound thread TryReceives
+// 8-byte headers. Producer and consumer are different OS threads,
+// so the map and FIFOs are mutex-guarded.
 
-static int g_msgpipe_next_uid = 0x2000;
+struct PspMsgPipe {
+    std::deque<uint8_t> fifo;
+    uint32_t buf_size = 0;
+};
+
+static std::mutex g_msgpipe_mtx;
+static std::unordered_map<int, PspMsgPipe> g_msgpipes;
+
+// waitMode values (PPSSPP SCE_KERNEL_MPW_*):
+// FULL(0) = all-or-nothing, ASAP(1) = partial transfer ok
+static constexpr uint32_t PSP_MPW_ASAP = 1;
 
 static void hle_sceKernelCreateMsgPipe(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    ctx->r[2] = g_msgpipe_next_uid++;
+    // a0=name, a1=part, a2=attr, a3=bufSize, t0=opt
+    uint32_t buf_size = static_cast<uint32_t>(ctx->r[7]);
+    int uid = psp_next_uid();
+    {
+        std::lock_guard<std::mutex> lock(g_msgpipe_mtx);
+        g_msgpipes[uid].buf_size = buf_size;
+    }
+    ctx->r[2] = uid;
     (void)rdram;
 }
 
 static void hle_sceKernelDeleteMsgPipe(
     uint8_t* rdram, recomp_context* ctx
 ) {
+    int uid = static_cast<int>(ctx->r[4]);
+    std::lock_guard<std::mutex> lock(g_msgpipe_mtx);
+    g_msgpipes.erase(uid);
     ctx->r[2] = SCE_OK;
     (void)rdram;
 }
 
+// Blocking send (NID 0x876DBFAD). Copies the message into the
+// FIFO; if the pipe is full, bounded-polls for space (the game
+// sends 84 bytes into a 1024-byte pipe, so this never blocks in
+// practice).
 static void hle_sceKernelSendMsgPipe(
     uint8_t* rdram, recomp_context* ctx
 ) {
+    int uid = static_cast<int>(ctx->r[4]);
+    uint32_t msg_ptr = static_cast<uint32_t>(ctx->r[5]);
+    uint32_t size = static_cast<uint32_t>(ctx->r[6]);
+    uint32_t result_ptr = static_cast<uint32_t>(ctx->r[8]);
+    // r[7]=waitMode, r[9]=timeout*: send completes immediately
+    // unless the pipe is full.
+
     sched_yield_point();
-    ctx->r[2] = SCE_OK;
-    (void)rdram;
+
+    for (int spins = 0; ; ++spins) {
+        {
+            std::lock_guard<std::mutex> lock(g_msgpipe_mtx);
+            auto it = g_msgpipes.find(uid);
+            if (it == g_msgpipes.end()) {
+                ctx->r[2] = SCE_KERNEL_ERROR_UNKNOWN_MPPID;
+                return;
+            }
+            PspMsgPipe& mp = it->second;
+            if (size > mp.buf_size) {
+                ctx->r[2] = SCE_KERNEL_ERROR_ILLEGAL_SIZE;
+                return;
+            }
+            if (mp.fifo.size() + size <= mp.buf_size) {
+                for (uint32_t i = 0; i < size; ++i) {
+                    mp.fifo.push_back(psp_mem_read<uint8_t>(
+                        rdram, msg_ptr + i));
+                }
+                if (result_ptr != 0) {
+                    psp_mem_write<uint32_t>(rdram, result_ptr,
+                                            size);
+                }
+                ctx->r[2] = SCE_OK;
+                return;
+            }
+        }
+        // Pipe full: bounded poll (~5s) for the consumer to drain.
+        if (g_should_exit.load() || spins >= 5000) {
+            ctx->r[2] = SCE_KERNEL_ERROR_MPP_FULL;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
+// Non-blocking receive (NID 0xDF52098F).
+// waitMode FULL(0): all-or-nothing — if fewer than `size` bytes
+// are buffered, return MPP_EMPTY without consuming anything.
+// waitMode ASAP(1): pop min(available, size) bytes.
 static void hle_sceKernelTryReceiveMsgPipe(
     uint8_t* rdram, recomp_context* ctx
 ) {
-    // Non-blocking receive: return "no data"
-    ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-    (void)rdram;
+    int uid = static_cast<int>(ctx->r[4]);
+    uint32_t buf_ptr = static_cast<uint32_t>(ctx->r[5]);
+    uint32_t size = static_cast<uint32_t>(ctx->r[6]);
+    uint32_t wait_mode = static_cast<uint32_t>(ctx->r[7]);
+    uint32_t result_ptr = static_cast<uint32_t>(ctx->r[8]);
+
+    std::lock_guard<std::mutex> lock(g_msgpipe_mtx);
+    auto it = g_msgpipes.find(uid);
+    if (it == g_msgpipes.end()) {
+        ctx->r[2] = SCE_KERNEL_ERROR_UNKNOWN_MPPID;
+        return;
+    }
+    PspMsgPipe& mp = it->second;
+    uint32_t avail = static_cast<uint32_t>(mp.fifo.size());
+
+    uint32_t count;
+    if (wait_mode == PSP_MPW_ASAP) {
+        count = std::min(avail, size);
+        if (count == 0 && size != 0) {
+            ctx->r[2] = SCE_KERNEL_ERROR_MPP_EMPTY;
+            return;
+        }
+    } else {  // FULL(0)
+        if (avail < size) {
+            ctx->r[2] = SCE_KERNEL_ERROR_MPP_EMPTY;
+            return;
+        }
+        count = size;
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        psp_mem_write<uint8_t>(rdram, buf_ptr + i, mp.fifo.front());
+        mp.fifo.pop_front();
+    }
+    if (result_ptr != 0) {
+        psp_mem_write<uint32_t>(rdram, result_ptr, count);
+    }
+    ctx->r[2] = SCE_OK;
 }
 
 // ---- Registration ----

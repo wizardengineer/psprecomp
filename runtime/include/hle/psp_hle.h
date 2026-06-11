@@ -40,6 +40,11 @@ constexpr int32_t SCE_KERNEL_ERROR_SEMA_OVERFLOW = (int32_t)0x800201AFU;
 constexpr int32_t SCE_KERNEL_ERROR_MUTEX_NOT_FOUND = (int32_t)0x800201C3U;
 constexpr int32_t SCE_KERNEL_ERROR_EVF_NOT_FOUND = (int32_t)0x800201BFU;
 constexpr int32_t SCE_KERNEL_ERROR_NOT_FOUND_MODULE = (int32_t)0x80020196U;
+// MsgPipe errors (PPSSPP Core/HLE/ErrorCodes.h; match pspkerror.h)
+constexpr int32_t SCE_KERNEL_ERROR_UNKNOWN_MPPID = (int32_t)0x8002019EU;
+constexpr int32_t SCE_KERNEL_ERROR_MPP_FULL      = (int32_t)0x800201B3U;
+constexpr int32_t SCE_KERNEL_ERROR_MPP_EMPTY     = (int32_t)0x800201B4U;
+constexpr int32_t SCE_KERNEL_ERROR_ILLEGAL_SIZE  = (int32_t)0x800201BCU;
 // IO kernel errors (PPSSPP Core/HLE/sceIo.cpp). NOTE: distinct from the
 // errno-style SCE_ERROR_ERRNO_EMFILE (0x80010018) above.
 constexpr int32_t SCE_KERNEL_ERROR_MFILE         = (int32_t)0x80020320U;
