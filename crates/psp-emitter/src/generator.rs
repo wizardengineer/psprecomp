@@ -51,6 +51,13 @@ pub trait Generator {
     fn emit_fpu_cc_write(&mut self, expr: &str);
     /// Read FPU condition code.
     fn emit_fpu_cc_read(&self) -> String;
+    /// Record a statically-known cross-function `RECOMP_LOOKUP` target.
+    ///
+    /// Called by emission paths that format `RECOMP_LOOKUP(0xADDR)` text via
+    /// `emit_raw` (cross-function branch tails), so dispatch-coverage auditing
+    /// sees every static target. `emit_call_lookup` implementations record
+    /// their own target. Default is a no-op.
+    fn note_static_lookup(&mut self, _vaddr: u32) {}
 }
 
 /// Test double for `Generator` — captures all emission calls as strings.

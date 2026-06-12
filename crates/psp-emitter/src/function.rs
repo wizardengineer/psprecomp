@@ -622,6 +622,7 @@ pub(crate) fn emit_branch_or_tail(
         }
     } else {
         // Cross-function branch: conditional tail call via dispatch table
+        gen.note_static_lookup(target);
         gen.emit_raw(&format!(
             "if ({cond}) {{ RECOMP_LOOKUP(0x{target:08X}u)(rdram, ctx); return; }}"
         ));

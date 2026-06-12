@@ -13,6 +13,11 @@ use crate::generator::Generator;
 pub struct CppGenerator {
     buf: String,
     indent: usize,
+    /// Statically-known cross-function `RECOMP_LOOKUP` targets emitted so far
+    /// (jump/call tails and `note_static_lookup` callers). Consumed by the
+    /// recompile report's dispatch-coverage audit via
+    /// [`CppGenerator::take_static_lookup_targets`].
+    static_lookup_targets: Vec<u32>,
 }
 
 impl CppGenerator {
@@ -21,12 +26,19 @@ impl CppGenerator {
         Self {
             buf: String::with_capacity(65536),
             indent: 0,
+            static_lookup_targets: Vec::new(),
         }
     }
 
     /// Return accumulated C++ source text and reset the buffer.
     pub fn take_output(&mut self) -> String {
         std::mem::take(&mut self.buf)
+    }
+
+    /// Return (and reset) the statically-known RECOMP_LOOKUP targets emitted
+    /// since the last call. Register-indirect lookups are never recorded.
+    pub fn take_static_lookup_targets(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.static_lookup_targets)
     }
 
     /// Emit the standard per-file header (`#include "recomp.h"` etc.).
@@ -370,7 +382,10 @@ impl Generator for CppGenerator {
                 ));
             }
         }
-        // Default: lookup via dispatch table
+        // Default: lookup via dispatch table.
+        // NOT recorded in static_lookup_targets: last_addr is an in-function
+        // jump-table label, by design absent from dispatch — recording it would
+        // flood the dispatch audit with intentional non-entries.
         if let Some((last_addr, _)) = cases.last() {
             self.writeln(&format!(
                 "default: RECOMP_LOOKUP(0x{last_addr:08X})(rdram, ctx); return;"
@@ -385,6 +400,7 @@ impl Generator for CppGenerator {
     }
 
     fn emit_call_lookup(&mut self, vaddr: u32) {
+        self.static_lookup_targets.push(vaddr);
         self.writeln(&format!("RECOMP_LOOKUP(0x{vaddr:08X})(rdram, ctx);"));
     }
 
@@ -416,6 +432,10 @@ impl Generator for CppGenerator {
 
     fn emit_fpu_cc_read(&self) -> String {
         "ctx->fpu_cc".into()
+    }
+
+    fn note_static_lookup(&mut self, vaddr: u32) {
+        self.static_lookup_targets.push(vaddr);
     }
 }
 
