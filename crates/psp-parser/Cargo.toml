@@ -9,6 +9,7 @@ byteorder = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 roxmltree = "0.20"
+tracing = "0.1"
 base64 = { version = "0.22", features = ["std"] }
 indexmap = { version = "2", features = ["serde"] }
 

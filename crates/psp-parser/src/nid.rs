@@ -33,9 +33,56 @@ pub fn load_nid_database(xml_path: &Path) -> Result<HashMap<u32, String>, ParseE
 
 /// Returns the function name for a NID, or a hex fallback string if unknown.
 ///
-/// The fallback is "NID_0xXXXXXXXX" — never panics.
+/// The fallback is "NID_0xXXXXXXXX" — never panics. Unresolved NIDs are
+/// detectable downstream via [`parse_fallback_name`]; the recompile report
+/// lists them so a database miss is never silent.
 pub fn resolve_nid(db: &HashMap<u32, String>, nid: u32) -> String {
-    db.get(&nid)
-        .cloned()
-        .unwrap_or_else(|| format!("NID_0x{nid:08X}"))
+    db.get(&nid).cloned().unwrap_or_else(|| fallback_name(nid))
+}
+
+/// Format the fallback name used when a NID is missing from the database.
+pub fn fallback_name(nid: u32) -> String {
+    format!("NID_0x{nid:08X}")
+}
+
+/// If `name` is an unresolved-NID fallback produced by [`fallback_name`],
+/// return the embedded NID; otherwise `None`.
+///
+/// Keeps the fallback pattern in one place so report code never hardcodes it.
+pub fn parse_fallback_name(name: &str) -> Option<u32> {
+    let hex = name.strip_prefix("NID_0x")?;
+    if hex.len() != 8 {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_miss_produces_parseable_fallback() {
+        let db: HashMap<u32, String> = HashMap::new();
+        let name = resolve_nid(&db, 0xDEAD_BEEF);
+        assert_eq!(name, "NID_0xDEADBEEF");
+        assert_eq!(parse_fallback_name(&name), Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn database_hit_is_not_a_fallback() {
+        let mut db = HashMap::new();
+        db.insert(0x1234_5678u32, "sceKernelCreateThread".to_string());
+        let name = resolve_nid(&db, 0x1234_5678);
+        assert_eq!(name, "sceKernelCreateThread");
+        assert_eq!(parse_fallback_name(&name), None);
+    }
+
+    #[test]
+    fn fallback_parser_rejects_malformed_names() {
+        assert_eq!(parse_fallback_name("NID_0x123"), None); // too short
+        assert_eq!(parse_fallback_name("NID_0x123456789"), None); // too long
+        assert_eq!(parse_fallback_name("NID_0xZZZZZZZZ"), None); // not hex
+        assert_eq!(parse_fallback_name("sceGeListEnQueue"), None);
+    }
 }

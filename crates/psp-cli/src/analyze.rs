@@ -276,13 +276,18 @@ pub fn run_analyze(
             })
             .collect();
 
-        reloc::apply_relocations(
+        let reloc_stats = reloc::apply_relocations(
             &mut seg_data_vecs,
             &seg_bases,
             &type_a_entries,
             &type_b_data,
         )
         .context("Relocation application failed")?;
+        tracing::info!(
+            "Applied {} relocations ({} unhandled types — see warnings above)",
+            reloc_stats.handled,
+            reloc_stats.unhandled.len(),
+        );
 
         // Also collect Type-B entries for the JSON record
         if !type_b_data.is_empty() {
