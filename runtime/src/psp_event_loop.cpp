@@ -2,6 +2,7 @@
 #include "psp_runtime.h"
 #include "psp_render_queue.h"
 #include "psp_scheduler.h"
+#include "psp_ge_draw.h"
 
 #include <SDL.h>
 #include <glad/glad.h>
@@ -153,6 +154,10 @@ void psp_event_loop(uint8_t* rdram) {
         // 2. Drain render queue — execute pending GL work from game threads
         render_queue_process();
 
+        // 2b. Service any pending debug-socket screenshot request here on
+        //     the main (GL) thread — the socket thread never touches GL.
+        ge_draw_service_screenshot_request();
+
         // 3. Check if any game threads are still alive
         if (g_alive_threads.load() == 0) {
             std::fprintf(stderr,
@@ -166,6 +171,7 @@ void psp_event_loop(uint8_t* rdram) {
                     handle_sdl_event(ev);
                 }
                 render_queue_process();
+                ge_draw_service_screenshot_request();
                 SDL_Delay(16);  // ~60fps drain rate
             }
             break;

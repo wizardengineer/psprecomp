@@ -26,6 +26,15 @@ extern std::atomic<uint32_t> g_host_buttons;
 extern std::atomic<uint32_t> g_injected_buttons;
 extern std::atomic<int64_t>  g_injected_buttons_deadline_ms;
 
+/// [#35] LOOKUP_MISS counters for the debug socket I command
+/// (implemented in psp_dispatch.cpp; relaxed-atomic, any thread).
+void psp_dispatch_get_miss_stats(uint32_t* unique_addrs,
+                                 uint64_t* total_calls);
+
+/// [#35] Recent dispatched-function ring (cross-thread copy of the
+/// PC-TRACE ring in psp_dispatch.cpp), oldest first. Returns count.
+int psp_dispatch_get_recent_funcs(uint32_t* out, int max);
+
 /// Debug-only GL thread safety check.
 /// In debug builds: aborts if current thread is not the main thread.
 /// In release builds: no-op.

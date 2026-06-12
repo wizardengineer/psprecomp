@@ -8,6 +8,9 @@
 
 #include <SDL.h>
 #include <glad/glad.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +27,25 @@ static bool g_has_drawn_prims = false;
 static bool g_screenshot_enabled = false;
 static bool g_screenshot_done = false;
 static char g_screenshot_path[256] = {};
+static std::atomic<bool> g_draw_ready{false};
+
+// ---- PRIM counters (file scope so ge_draw_get_stats can read them) ----
+// Written only by the render thread inside ge_draw_prim; read racily by
+// the debug socket's I command (a few prims stale is fine).
+static int g_prim_type_count[8] = {0};   // PRIM types 0-6 + slot 7 safety
+static int g_prim_type_count_clear[8] = {0};
+static int g_prim_type_zero_count = 0;   // count <= 0 (degenerate)
+static int g_prim_total_observed = 0;
+
+// ---- On-demand screenshot request (issue #35 debug socket S command) ----
+// Requester (any thread) posts a path + waits on the condvar; the render
+// thread polls ge_draw_service_screenshot_request() each event-loop pass
+// and performs the GL readback there (GL never leaves the main thread).
+static std::mutex g_ss_req_mutex;
+static std::condition_variable g_ss_req_cv;
+static char g_ss_req_path[512] = {};
+enum SsReqState { SS_IDLE = 0, SS_PENDING = 1, SS_DONE = 2, SS_FAILED = 3 };
+static int g_ss_req_state = SS_IDLE;
 
 // ---- Packed vertex for VBO upload ----
 // Layout: 3 floats (pos) + 2 floats (uv) + 4 bytes (color)
@@ -38,7 +60,7 @@ static_assert(sizeof(PackedVertex) == 24,
 
 // ---- Screenshot (TGA format -- no external dependency) ----
 
-static void write_tga(
+static bool write_tga(
     const char* path,
     const uint8_t* pixels,
     int width,
@@ -49,7 +71,7 @@ static void write_tga(
         std::fprintf(stderr,
             "[DRAW] Cannot open %s for screenshot\n",
             path);
-        return;
+        return false;
     }
 
     // TGA header (18 bytes) -- uncompressed RGBA
@@ -79,6 +101,21 @@ static void write_tga(
     std::fprintf(stderr,
         "[DRAW] Screenshot saved: %s (%dx%d)\n",
         path, width, height);
+    return true;
+}
+
+/// Read the FBO back, flip, and write a TGA. Render (GL) thread only.
+static bool capture_fbo_to_tga(const char* path) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+    std::vector<uint8_t> pixels(480 * 272 * 4);
+    glReadPixels(0, 0, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    // Flip vertically (GL origin is bottom-left)
+    std::vector<uint8_t> flipped(480 * 272 * 4);
+    for (int y = 0; y < 272; y++) {
+        std::memcpy(flipped.data() + y * 480 * 4,
+                    pixels.data() + (271 - y) * 480 * 4, 480 * 4);
+    }
+    return write_tga(path, flipped.data(), 480, 272);
 }
 
 // ---- GL state mapping ----
@@ -263,12 +300,14 @@ void ge_draw_init() {
     ge_shader_init();
 
     g_frame_counter = 0;
+    g_draw_ready.store(true, std::memory_order_release);
 
     std::fprintf(stderr,
         "[DRAW] Draw infrastructure initialized\n");
 }
 
 void ge_draw_shutdown() {
+    g_draw_ready.store(false, std::memory_order_release);
     // Auto-capture final frame if any PRIMs were rendered and no screenshot taken yet
     if (g_has_drawn_prims && !g_screenshot_done) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
@@ -341,20 +380,18 @@ void ge_draw_prim(
     // lines reach stderr (all clear=1). The pre-existing [DRAW_PRIM] log
     // rate-limit (first 50 + every 25th + first 5 non-clear) hides the
     // breakdown. This block counts EVERY call by (prim_type, clear) bucket.
-    static int prim_type_count[8] = {0};   // PRIM types 0-6 + slot 7 safety
-    static int prim_type_count_clear[8] = {0};
-    static int prim_type_zero_count = 0;   // count <= 0 (degenerate)
-    static int prim_total_observed = 0;
+    // (Counter definitions moved to file scope -- g_prim_* above -- so the
+    // debug socket's I command can snapshot them via ge_draw_get_stats.)
     static bool prim_detail_atexit_installed = false;
     if (!prim_detail_atexit_installed) {
         std::atexit([]() {
             std::fprintf(stderr,
                 "[GE_PRIM_DETAIL_SUMMARY] total_observed=%d zero_count=%d\n",
-                prim_total_observed, prim_type_zero_count);
+                g_prim_total_observed, g_prim_type_zero_count);
             int real_ns = 0, sprite_nc = 0, clears = 0;
             for (int t = 0; t < 8; ++t) {
-                int normal = prim_type_count[t];
-                int clear = prim_type_count_clear[t];
+                int normal = g_prim_type_count[t];
+                int clear = g_prim_type_count_clear[t];
                 clears += clear;
                 if (t == 6) sprite_nc += normal; else real_ns += normal;
                 if (normal == 0 && clear == 0) continue;
@@ -381,7 +418,7 @@ void ge_draw_prim(
     static bool selftest_done = false;
     if (!selftest_done && std::getenv("PSPRECOMP_GEOM_SELFTEST")) {
         selftest_done = true;
-        prim_type_count[GE_PRIM_TRIANGLE_STRIP]++;
+        g_prim_type_count[GE_PRIM_TRIANGLE_STRIP]++;
         std::fprintf(stderr,
             "[GE_GEOM_REAL_DRAW] FIRST real geometry draw: "
             "type=%d count=%d (success-bar (b) MET) [SELFTEST]\n",
@@ -389,9 +426,9 @@ void ge_draw_prim(
         std::fflush(stderr);
     }
 
-    prim_total_observed++;
+    g_prim_total_observed++;
     if (count <= 0) {
-        prim_type_zero_count++;
+        g_prim_type_zero_count++;
         return;
     }
 
@@ -402,9 +439,9 @@ void ge_draw_prim(
     {
         int t_idx = (prim_type >= 0 && prim_type < 8) ? prim_type : 7;
         if (state.clear_mode) {
-            prim_type_count_clear[t_idx]++;
+            g_prim_type_count_clear[t_idx]++;
         } else {
-            prim_type_count[t_idx]++;
+            g_prim_type_count[t_idx]++;
         }
 
         // [GE_GEOM_VERDICT] live verification sentinels — the definitive answer
@@ -429,17 +466,17 @@ void ge_draw_prim(
 
         // Periodic heartbeat: a killed or hung run still leaves a current tally
         // in the log (every 256 PRIMs observed). real_nonsprite>0 == graphics.
-        if (prim_total_observed % 256 == 0) {
+        if (g_prim_total_observed % 256 == 0) {
             int real_ns = 0, sprite_nc = 0, clears = 0;
             for (int t = 0; t < 8; ++t) {
-                clears += prim_type_count_clear[t];
-                if (t == 6) sprite_nc += prim_type_count[t];
-                else real_ns += prim_type_count[t];
+                clears += g_prim_type_count_clear[t];
+                if (t == 6) sprite_nc += g_prim_type_count[t];
+                else real_ns += g_prim_type_count[t];
             }
             std::fprintf(stderr,
                 "[GE_GEOM_HEARTBEAT] prims=%d real_nonsprite=%d "
                 "sprite_nonclear=%d clears=%d\n",
-                prim_total_observed, real_ns, sprite_nc, clears);
+                g_prim_total_observed, real_ns, sprite_nc, clears);
             std::fflush(stderr);
         }
     }
@@ -724,4 +761,71 @@ void ge_present_frame(
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     SDL_GL_SwapWindow(window);
+}
+
+// ---- Debug socket accessors (issue #35) ----
+
+void ge_draw_get_stats(
+    uint32_t* frames,
+    int* prims_total,
+    int* real_nonsprite,
+    int* sprite_nonclear,
+    int* clears
+) {
+    // Racy reads of render-thread counters -- diagnostics only.
+    if (frames) *frames = g_frame_counter;
+    if (prims_total) *prims_total = g_prim_total_observed;
+    int real_ns = 0, sprite_nc = 0, clr = 0;
+    for (int t = 0; t < 8; ++t) {
+        clr += g_prim_type_count_clear[t];
+        if (t == 6) sprite_nc += g_prim_type_count[t];
+        else real_ns += g_prim_type_count[t];
+    }
+    if (real_nonsprite) *real_nonsprite = real_ns;
+    if (sprite_nonclear) *sprite_nonclear = sprite_nc;
+    if (clears) *clears = clr;
+}
+
+bool ge_draw_capture_screenshot(const char* path, int timeout_ms) {
+    if (!g_draw_ready.load(std::memory_order_acquire)) {
+        std::fprintf(stderr,
+            "[DRAW] Screenshot request before GL init: %s\n", path);
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(g_ss_req_mutex);
+    if (g_ss_req_state == SS_PENDING) {
+        // Another client's capture is in flight -- refuse instead of
+        // overwriting its path.
+        return false;
+    }
+    std::strncpy(g_ss_req_path, path, sizeof(g_ss_req_path) - 1);
+    g_ss_req_path[sizeof(g_ss_req_path) - 1] = '\0';
+    g_ss_req_state = SS_PENDING;
+    bool finished = g_ss_req_cv.wait_for(
+        lock, std::chrono::milliseconds(timeout_ms),
+        [] { return g_ss_req_state == SS_DONE
+                    || g_ss_req_state == SS_FAILED; });
+    bool ok = finished && g_ss_req_state == SS_DONE;
+    g_ss_req_state = SS_IDLE;   // reset (also cancels on timeout)
+    return ok;
+}
+
+void ge_draw_service_screenshot_request() {
+    char path[sizeof(g_ss_req_path)];
+    {
+        std::lock_guard<std::mutex> lock(g_ss_req_mutex);
+        if (g_ss_req_state != SS_PENDING) return;
+        std::memcpy(path, g_ss_req_path, sizeof(path));
+    }
+    // GL work outside the request lock (requester only waits on the cv).
+    bool ok = g_draw_ready.load(std::memory_order_acquire)
+              && capture_fbo_to_tga(path);
+    {
+        std::lock_guard<std::mutex> lock(g_ss_req_mutex);
+        // Only publish if the requester hasn't timed out and reset state.
+        if (g_ss_req_state == SS_PENDING) {
+            g_ss_req_state = ok ? SS_DONE : SS_FAILED;
+        }
+    }
+    g_ss_req_cv.notify_all();
 }

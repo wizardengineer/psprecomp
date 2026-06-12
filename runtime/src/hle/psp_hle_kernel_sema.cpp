@@ -310,6 +310,13 @@ static void hle_sceKernelWaitSema(
     SemaWaiter waiter{signal, false};
     s->waiters.push_back(&waiter);
 
+    // [#35] Tag this thread's wait for the debug socket I command.
+    {
+        char wait_tag[24];
+        std::snprintf(wait_tag, sizeof(wait_tag), "sema:%d", uid);
+        psp_thread_note_wait(wait_tag);
+    }
+
     s->wait_count++;
     if (timeout_ptr != 0) {
         uint32_t timeout_us = psp_mem_read<uint32_t>(
@@ -323,6 +330,7 @@ static void hle_sceKernelWaitSema(
             // by the signaller and we fall through as acquired.
             sema_remove_waiter(*s, &waiter);
             s->wait_count--;
+            psp_thread_clear_wait();
             ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
             return;
         }
@@ -340,11 +348,13 @@ static void hle_sceKernelWaitSema(
             // g_should_exit: bail without consuming the resource.
             sema_remove_waiter(*s, &waiter);
             s->wait_count--;
+            psp_thread_clear_wait();
             ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
             return;
         }
     }
     s->wait_count--;
+    psp_thread_clear_wait();
 
     // Granted: the signaller already transferred the count to us --
     // do NOT decrement current_count here.
@@ -396,6 +406,14 @@ static void hle_sceKernelWaitSemaCB(
     constexpr int MAX_CB_LOOPS = 10000;
     int loops = 0;
 
+    // [#35] Tag this thread's wait for the debug socket I command (the CB
+    // variant is a poll loop, but it is still semantically a sema wait).
+    {
+        char wait_tag[24];
+        std::snprintf(wait_tag, sizeof(wait_tag), "semacb:%d", uid);
+        psp_thread_note_wait(wait_tag);
+    }
+
     while (!g_should_exit.load()) {
         // 1. Process pending callbacks
         psp_kernel_check_callbacks(rdram, ctx);
@@ -416,6 +434,7 @@ static void hle_sceKernelWaitSemaCB(
                         "caller=0x%08X\n",
                         s->current_count, g_last_func_addr);
                 }
+                psp_thread_clear_wait();
                 ctx->r[2] = SCE_OK;
                 return;
             }
@@ -443,6 +462,7 @@ static void hle_sceKernelWaitSemaCB(
     }
 
     // Fallback: do a blocking wait (limited timeout)
+    psp_thread_clear_wait();  // [#35] WaitSema below re-tags if it blocks
     hle_sceKernelWaitSema(rdram, ctx);
 }
 

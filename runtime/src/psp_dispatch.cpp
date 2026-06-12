@@ -2,6 +2,7 @@
 #include "hle/psp_hle.h"
 #include "hle/psp_hle_kernel.h"
 #include "psp_scheduler.h"
+#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>
@@ -32,6 +33,41 @@ static thread_local uint32_t g_last_miss_addr = 0;
 // psp_trace_checkpoint. Cheap: one array write per checkpoint.
 thread_local uint32_t g_func_ring[32] = {0};
 thread_local uint32_t g_func_ring_pos = 0;
+
+// [#35] Cross-thread copy of the dispatched-function ring for the debug
+// socket's I command. The per-thread g_func_ring above is thread_local and
+// unreadable from the socket thread, so psp_trace_checkpoint also appends
+// to this shared ring with relaxed atomics (interleaves all game threads;
+// ordering across threads is approximate -- diagnostics only).
+static std::atomic<uint32_t> g_shared_func_ring[64];
+static std::atomic<uint32_t> g_shared_func_ring_pos{0};
+
+// [#35] LOOKUP_MISS counters readable from the debug socket thread.
+// The g_miss_counts map below is mutated without a lock from game threads,
+// so the socket must NOT iterate it (rehash mid-read). These atomics carry
+// the two numbers the I command needs.
+static std::atomic<uint32_t> g_miss_unique{0};
+static std::atomic<uint64_t> g_miss_total{0};
+
+void psp_dispatch_get_miss_stats(uint32_t* unique_addrs,
+                                 uint64_t* total_calls) {
+    if (unique_addrs)
+        *unique_addrs = g_miss_unique.load(std::memory_order_relaxed);
+    if (total_calls)
+        *total_calls = g_miss_total.load(std::memory_order_relaxed);
+}
+
+int psp_dispatch_get_recent_funcs(uint32_t* out, int max) {
+    uint32_t pos = g_shared_func_ring_pos.load(std::memory_order_relaxed);
+    int n = 0;
+    // Oldest first: walk forward from the slot the next write would claim.
+    for (int i = 0; i < 64 && n < max; i++) {
+        uint32_t v = g_shared_func_ring[(pos + static_cast<uint32_t>(i)) & 63u]
+                         .load(std::memory_order_relaxed);
+        if (v) out[n++] = v;
+    }
+    return n;
+}
 
 static void noop_stub(uint8_t* rdram, recomp_context* ctx) {
     uint32_t addr = g_last_miss_addr;
@@ -239,7 +275,9 @@ FuncPtr psp_on_lookup_miss(uint32_t vaddr) {
     // Per-address miss counting -- log on first hit only
     int& count = g_miss_counts[vaddr];
     count++;
+    g_miss_total.fetch_add(1, std::memory_order_relaxed);
     if (count == 1) {
+        g_miss_unique.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr,
             "[LOOKUP_MISS] addr=0x%08X (first hit)\n", vaddr);
     }
@@ -344,6 +382,12 @@ void psp_trace_checkpoint(uint32_t addr) {
     g_prev_func_addr = g_last_func_addr;
     g_last_func_addr = addr;
     g_func_ring[(g_func_ring_pos++) & 31u] = addr;
+    // [#35] shared (cross-thread) ring for the debug socket I command.
+    // One relaxed fetch_add + store per function entry; measured noise is
+    // acceptable for a diagnostics-first runtime.
+    g_shared_func_ring[g_shared_func_ring_pos.fetch_add(
+        1, std::memory_order_relaxed) & 63u]
+        .store(addr, std::memory_order_relaxed);
 
     // [SPLEAK] env PSPRECOMP_SPLEAK: shadow-stack reconstruction of sp at every
     // function entry to pin the function that RETURNS with sp imbalanced (the

@@ -1,4 +1,5 @@
 #include "psp_scheduler.h"
+#include "psp_debug_socket.h"  // PspDebugThreadInfo ([#35] I command)
 #include "hle/psp_hle.h"  // SCE_KERNEL_ERROR_WAIT_TIMEOUT
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,8 @@ void psp_scheduler_init() {
         g_threads[i].stack_top = 0;
         g_threads[i].wakeup_count = 0;
         std::memset(g_threads[i].name, 0, sizeof(g_threads[i].name));
+        std::memset(g_threads[i].wait_reason, 0,
+                    sizeof(g_threads[i].wait_reason));
         std::memset(&g_threads[i].ctx, 0, sizeof(recomp_context));
     }
 }
@@ -55,6 +58,7 @@ int psp_thread_create(
             t.stack_top = stack_top;
             t.wakeup_count = 0;
             std::memset(t.name, 0, sizeof(t.name));
+            std::memset(t.wait_reason, 0, sizeof(t.wait_reason));
             if (name) {
                 std::strncpy(t.name, name, sizeof(t.name) - 1);
             }
@@ -330,6 +334,8 @@ int psp_thread_sleep_current() {
 
     // Enter WAIT_SLEEP state
     g_current->status = WAIT_SLEEP;
+    std::strncpy(g_current->wait_reason, "sleep",
+                 sizeof(g_current->wait_reason) - 1);
 
     // Wake next READY thread before sleeping (prevents deadlock)
     for (int i = 0; i < MAX_THREADS; i++) {
@@ -359,6 +365,7 @@ int psp_thread_sleep_current() {
             "SCHED: thread %d (%s) sleep safety valve "
             "triggered\n", self->id, self->name);
     }
+    self->wait_reason[0] = '\0';
 
     return 0;
 }
@@ -412,6 +419,8 @@ int psp_thread_wait_end(int thid, int timeout_us) {
     // Block current thread, wake next READY thread
     PspThread* self = g_current;
     self->status = WAIT;
+    std::snprintf(self->wait_reason, sizeof(self->wait_reason),
+                  "thread_end:%d", thid);
 
     for (int i = 0; i < MAX_THREADS; i++) {
         PspThread& other = g_threads[i];
@@ -438,6 +447,7 @@ int psp_thread_wait_end(int thid, int timeout_us) {
     );
 
     self->status = RUNNING;
+    self->wait_reason[0] = '\0';
 
     if (!done && t.status != DEAD && t.in_use) {
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
@@ -460,6 +470,9 @@ void psp_thread_wait(int thid) {
     }
     if (t.status == RUNNING || t.status == READY) {
         t.status = WAIT;
+        if (t.wait_reason[0] == '\0') {
+            std::strncpy(t.wait_reason, "wait", sizeof(t.wait_reason) - 1);
+        }
     }
 }
 
@@ -477,6 +490,53 @@ void psp_thread_resume(int thid) {
     }
     if (t.status == WAIT) {
         t.status = READY;
+        t.wait_reason[0] = '\0';
         t.cv.notify_one();
     }
+}
+
+// ---------------------------------------------------------------------------
+// [#35] Debug socket support — wait-reason notes + thread snapshot
+// ---------------------------------------------------------------------------
+
+void psp_thread_note_wait(const char* reason) {
+    if (!g_current || !reason) {
+        return;
+    }
+    std::strncpy(g_current->wait_reason, reason,
+                 sizeof(g_current->wait_reason) - 1);
+    g_current->wait_reason[sizeof(g_current->wait_reason) - 1] = '\0';
+}
+
+void psp_thread_clear_wait() {
+    if (!g_current) {
+        return;
+    }
+    g_current->wait_reason[0] = '\0';
+}
+
+int psp_scheduler_snapshot(PspDebugThreadInfo* out, int max) {
+    static const char* kStatusNames[] = {
+        "DORMANT", "READY", "RUNNING", "WAIT", "DEAD", "WAIT_SLEEP"
+    };
+    std::unique_lock<std::mutex> lock(g_sched_mutex);
+    int n = 0;
+    for (int i = 0; i < MAX_THREADS && n < max; i++) {
+        PspThread& t = g_threads[i];
+        if (!t.in_use) {
+            continue;
+        }
+        PspDebugThreadInfo& info = out[n++];
+        info.id = t.id;
+        std::strncpy(info.name, t.name, sizeof(info.name) - 1);
+        info.name[sizeof(info.name) - 1] = '\0';
+        int s = static_cast<int>(t.status);
+        const char* status = (s >= 0 && s <= 5) ? kStatusNames[s] : "?";
+        std::strncpy(info.status, status, sizeof(info.status) - 1);
+        info.status[sizeof(info.status) - 1] = '\0';
+        std::strncpy(info.wait_reason, t.wait_reason,
+                     sizeof(info.wait_reason) - 1);
+        info.wait_reason[sizeof(info.wait_reason) - 1] = '\0';
+    }
+    return n;
 }

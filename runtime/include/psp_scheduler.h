@@ -63,6 +63,8 @@ struct PspThread {
     uint32_t stack_top;         ///< Initial SP value
     int wakeup_count;           ///< Sleep/wakeup counter (PPSSPP semantics)
     char name[32];              ///< Thread name for debugging
+    char wait_reason[24];       ///< Why the thread is blocked (e.g. "sema:259",
+                                ///< "sleep"); diagnostics only, racy reads OK
 };
 
 /// Initialize scheduler — zero all 64 thread slots.
@@ -124,3 +126,15 @@ void psp_thread_wait(int thid);
 
 /// Set thread to READY status and notify (called by HLE stubs to unblock).
 void psp_thread_resume(int thid);
+
+/// [#35] Record/clear why the CURRENT thread is about to block (e.g.
+/// "sema:259", "sleep"). Pure diagnostics for the debug socket I command;
+/// no locking (single writer = the thread itself; readers tolerate races).
+void psp_thread_note_wait(const char* reason);
+void psp_thread_clear_wait();
+
+/// [#35] Copy id/name/status/wait_reason of every in-use thread slot into
+/// `out` (up to `max` entries) for the debug socket I command. Takes the
+/// scheduler mutex briefly. Returns the number of entries written.
+struct PspDebugThreadInfo;
+int psp_scheduler_snapshot(PspDebugThreadInfo* out, int max);
