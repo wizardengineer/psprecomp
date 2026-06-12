@@ -130,23 +130,29 @@ at the symptom site and let normal runs capture it.
 
 ## 6. Runtime debug socket (TCP 127.0.0.1:9999)
 
-Started automatically (`runtime/src/psp_debug_socket.cpp`). One command per line via `nc`.
+Started automatically (`runtime/src/psp_debug_socket.cpp`). One command per line via `nc`;
+multiple concurrent clients supported. **v2 framing:** every command replies
+`OK <len>\n` + `<len>` payload bytes, or `ERR <reason>\n` — malformed input is never
+silently dropped. Full protocol details in the issue #35 section below.
 
-| Command | Effect |
-|---|---|
-| `R <hexaddr> <size>` | Read masked PSP memory, raw bytes |
-| `B <hexmask> <ms>` | Inject button mask for duration (UP=10, CROSS=4000, START=8; clamped 60 s) |
+| Command | Effect | Reply |
+|---|---|---|
+| `I` | Runtime info (uptime, GE counters, LOOKUP_MISS, recent funcs, threads) | `OK <len>` + one JSON line |
+| `R <hexaddr> <decsize>` | Read masked PSP memory (≤65536 bytes; out-of-range zero-filled) | `OK <size>` + raw bytes |
+| `RAW <hexaddr> <decsize>` | Legacy v1 read — unframed | raw bytes only |
+| `W <hexaddr> <hexbytes>` | Write bytes into rdram (masked; whole range must be in bounds) | `OK 0` |
+| `B <hexmask> <decms>` | Inject button mask for duration (UP=10, CROSS=4000, START=8; clamped 60 s) | `OK 0` |
+| `S <path>` | Screenshot: render thread writes 480x272 TGA to `<path>` | `OK 0` (≤10 s) or `ERR timeout` |
 
 ```bash
 printf 'B 10 250\n'   | nc 127.0.0.1 9999   # UP
 printf 'B 4000 250\n' | nc 127.0.0.1 9999   # CROSS
+printf 'I\n' | nc -w 3 127.0.0.1 9999 | tail -n +2 | jq .   # info as JSON
 ```
 
 Keyboard (window focus required): arrows=D-pad, X/Enter=CROSS, Z=CIRCLE, A=SQUARE,
 S=TRIANGLE, Q/W=L/R, Space=START, Tab=SELECT. Buttons auto-release on focus loss — prefer
 the socket for scripted/agent input.
-
-(Issue #35 extends this protocol — its section below documents the v2 commands.)
 
 ## 7. Trace environment flags
 
@@ -193,7 +199,78 @@ and prefer not to rely on them (issue #43 tracks a proper registry/channel syste
 Sections below are added by the issue that introduced the infrastructure. Each section:
 what was added, how to use it, how it was verified, and any new failure modes discovered.
 
-<!-- #35 debug socket v2: section added by its implementation -->
+## #35 — Debug socket v2 (ACK framing, info JSON, write, screenshot, multi-client)
+
+**What was added** (`runtime/src/psp_debug_socket.cpp`, hooks wired in `runtime/src/main.cpp`):
+
+- **ACK framing.** Every command replies `OK <len>\n` followed by exactly `<len>` payload
+  bytes, or `ERR <reason>\n` with no payload. Malformed/unknown input always gets an ERR
+  (v1 dropped it silently, which made scripted probing indistinguishable from a hang).
+- **Multi-client.** Thread-per-client accept loop; concurrent `nc` sessions are independent
+  (v1 served one client at a time — a second connect hung until the first closed).
+- **Legacy compat choice:** v2 frames `R`; the v1 unframed read survives verbatim as the
+  `RAW <hexaddr> <decsize>` alias (success replies are raw bytes with no header; malformed
+  RAW still gets ERR). Old clients switch `R`→`RAW`, new clients use framed `R`.
+
+### Command reference
+
+| Command | Args | Success reply | ERR reasons |
+|---|---|---|---|
+| `I` | — | `OK <len>` + one newline-terminated JSON line | — |
+| `R` | `<hexaddr> <decsize>` (1..65536) | `OK <size>` + raw bytes; masked `0x07FFFFFF`; out-of-range tail zero-filled | `bad-addr`, `bad-size`, `size-out-of-range` |
+| `RAW` | same as `R` | raw bytes, **no header** (v1 behavior) | same as `R` |
+| `W` | `<hexaddr> <hexbytes>` (even-length hex, no spaces) | `OK 0` | `bad-addr`, `bad-bytes`, `out-of-range` (whole range must fit — no partial writes) |
+| `B` | `<hexmask> <decms>` (clamped 60 s) | `OK 0` | `bad-mask`, `bad-duration` |
+| `S` | `<path>` (rest of line, spaces allowed) | `OK 0` after the TGA is on disk | `bad-path`, `unsupported`, `timeout` (10 s; also covers pre-GL boot and a concurrent capture in flight) |
+| anything else | | | `unknown-command`, `empty`, `line-too-long` (>4095 chars; connection stays usable) |
+
+### `I` JSON schema (one line, jq-able)
+
+```json
+{"uptime_sec": 70.9,
+ "ge": {"frames": 1667, "prims": 12696, "real_nonsprite": 11030,
+        "sprite_nonclear": 0, "clears": 1666},
+ "lookup_miss": {"unique": 1, "total": 1},
+ "recent_funcs": ["0x089B440C", "..."],
+ "threads": [{"id": 0, "name": "user_main", "status": "RUNNING", "wait": ""},
+             {"id": 2, "name": "sgx-psp-freq-thr", "status": "RUNNING", "wait": "sema:278"}]}
+```
+
+- `ge.*` mirrors the `[GE_GEOM_*]` sentinel counters (`real_nonsprite > 0` == GRAPHICS).
+- `recent_funcs` is a shared 64-entry ring fed by every recompiled-function entry,
+  oldest first — entries from all game threads interleave, so cross-thread ordering is
+  approximate. (The per-thread PC-TRACE ring is `thread_local` and not readable here.)
+- `threads[].status` ∈ DORMANT/READY/RUNNING/WAIT/DEAD/WAIT_SLEEP. `wait` is `sema:<uid>` /
+  `semacb:<uid>` / `sleep` / `thread_end:<id>` / `""`. **Caveat:** sema waits block on the
+  sema's own condvar without changing scheduler status, so a sema-blocked thread shows
+  `status:"RUNNING"` with a non-empty `wait` — trust `wait` over `status` for "is it stuck".
+- All reads are deliberately racy snapshots (documented in code); never assert on exact counts.
+
+```bash
+printf 'I\n' | nc -w 3 127.0.0.1 9999 | tail -n +2 \
+  | jq '{frames: .ge.frames, waits: [.threads[] | select(.wait != "") | {name, wait}]}'
+printf 'W 9FFFF00 DEADBEEF\n' | nc -w 3 127.0.0.1 9999       # OK 0
+printf 'R 9FFFF00 4\n' | nc -w 3 127.0.0.1 9999 | xxd        # OK 4 + dead beef
+printf 'S /tmp/frame.tga\n' | nc -w 12 127.0.0.1 9999        # OK 0 once written
+```
+
+**Screenshot path obeys the GL rule:** the socket thread only posts a request; the main
+(GL) thread polls `ge_draw_service_screenshot_request()` each event-loop pass next to
+`render_queue_process()` and does the FBO readback there. Give `nc` a `-w` ≥ the service
+latency (capture is usually <50 ms once GL is up; the 10 s bound covers pre-GL boot).
+
+**Failure modes discovered during verification:**
+- `S` before `ge_draw_init` (first ~1 s of boot) fails fast → `ERR timeout`; retry later.
+- v1's `strtoul` parsing accepted garbage as address 0 — v2 rejects empty/garbage tokens
+  explicitly (`bad-addr`/`bad-size`), so don't rely on `R zz 4` reading address 0 anymore.
+- `W` refuses partially-out-of-range writes entirely (no partial write), unlike `R` which
+  zero-fills — asymmetry is intentional.
+
+**How verified:** `runtime/build/test_debug_socket` (59 checks: framing, ERR paths, W/R
+round-trip, masking, JSON shape + hostile-name escaping, two concurrent clients, oversized
+line) plus a live run against Patapon — `I` during boot and at title, `W`+`R` round-trip at
+`0x09FFFF00`, `S` produced the actual 480x272 title-screen TGA mid-run, `B 4000 250` → `OK 0`,
+malformed commands → ERR, two simultaneous `nc` sessions served concurrently.
 <!-- #36 build fingerprinting: section added by its implementation -->
 <!-- #37 recompile report: section added by its implementation -->
 <!-- #38 dump single-function: section added by its implementation -->

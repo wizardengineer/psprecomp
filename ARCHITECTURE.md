@@ -75,7 +75,7 @@ All under `runtime/` (headers in `runtime/include/`, sources in `runtime/src/`):
 | Event loop | `psp_event_loop.cpp` | SDL2 event pump, quit handling, render-queue drain |
 | VFPU | `psp_vfpu_*.cpp` | VFPU instruction implementations (arith, convert, matrix, mem, trig, misc) |
 | Asset/BND | `asset_bnd.cpp` | Patapon BND archive directory parsing (e.g. `DATA_CMN.BND`) |
-| Debug socket | `psp_debug_socket.cpp` | TCP server on port 9999 for live memory inspection |
+| Debug socket | `psp_debug_socket.cpp` | TCP server on port 9999, multiple concurrent clients, OK/ERR-framed line protocol: memory read/write, runtime-info JSON, button injection, screenshots (serviced by the render thread). Protocol reference: DEBUGGING.md §6 |
 
 ## Key Data Flow
 
