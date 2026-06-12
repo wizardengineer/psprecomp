@@ -272,5 +272,77 @@ line) plus a live run against Patapon — `I` during boot and at title, `W`+`R` 
 `0x09FFFF00`, `S` produced the actual 480x272 title-screen TGA mid-run, `B 4000 250` → `OK 0`,
 malformed commands → ERR, two simultaneous `nc` sessions served concurrently.
 <!-- #36 build fingerprinting: section added by its implementation -->
-<!-- #37 recompile report: section added by its implementation -->
+## #37 — recompile_report.json (silent-path audit)
+
+Every `psprecomp recompile` run writes `<output>/recompile_report.json` and prints a
+one-paragraph summary. The report turns the pipeline's four historically *silent* failure
+paths into named, counted artifacts — read it first when triaging a new game or an
+unexplained runtime divergence.
+
+### The four silent paths it exposes
+
+| Path | What used to happen | Report field |
+|------|--------------------|--------------|
+| Unhandled relocation types | `reloc.rs` left the word untouched for anything other than R_MIPS_32/26/HI16/LO16 — unrelocated pointers with no trace | `unhandled_relocations` (r_type → count); also warned once per type at analyze time |
+| Unresolved NIDs | a database miss silently became a `NID_0x%08X` stub name | `unresolved_nids[]` (nid, stub_addr, fallback_name) |
+| Decode errors | function silently emitted as an empty stub with a comment | `decode_errors[]` (address, name, error) |
+| Unbacked static dispatch targets | emitter generated `RECOMP_LOOKUP(0xADDR)` for a target absent from the dispatch table — a guaranteed LOOKUP_MISS if reached | `dispatch_audit.missing_targets[]` |
+
+### Schema (schema_version 1)
+
+Top-level keys: `schema_version`, `generated_at` (ISO-8601 UTC), `counts`,
+`decode_errors[]`, `unresolved_nids[]`, `unhandled_relocations{}`, `dispatch_audit{}`,
+`dedup_renames[]`. All addresses are hex strings (`"0x%08X"`, analysis.json style);
+`unhandled_relocations` keys are decimal r_type values as strings.
+
+`counts` carries the self-check numbers: `functions_total`, `functions_by_source`
+(analysis.json `source` field), `discovery` (recompile-stage pass breakdown:
+force/raw_scan/prologue/gap_start/gap_rescued), `mid_entries`, `batch_files`,
+`imports_total`, plus a total per silent-path category. `dedup_renames[]` lists every
+function the emitter renamed with the `_ADDR` suffix for ODR safety (the dispatch/funcs.h
+name to grep for is `unique_name`, not the Ghidra name).
+
+Authoritative schema doc: module header of `crates/psp-cli/src/report.rs`.
+
+### Count assertions (--expect flags)
+
+```bash
+PSPRECOMP_CROSS_MID=1 cargo run --release -- recompile analysis.json -o output \
+    --expect-functions 14104 --expect-mid-entries 2022   # Patapon baseline
+```
+
+On mismatch, recompile exits nonzero with a clear error — *after* writing the report, so
+the counts breakdown is available for triage. Both flags are optional; use them in scripts
+and verification gates to turn the documented baseline into an assertion instead of a
+doc-comment that drifts.
+
+### Triaging a new game with the report
+
+1. Recompile without expect flags; read the printed summary line.
+2. `unhandled_relocations` non-empty (PRX games) → relocation support gap; affected code
+   reads unrelocated pointers. Fix in `psp-parser/src/reloc.rs` before chasing runtime bugs.
+3. `unresolved_nids` non-empty → update the NID database; each listed stub is an import the
+   runtime can only no-op. (ELF games like Patapon have an empty analysis.json `imports`
+   array — their stubs are discovered from `.lib.stub` at analyze time, so this list covers
+   PRX-style imports.)
+4. `decode_errors`: cluster the addresses. A contiguous run of entries with ASCII-looking
+   words (e.g. `0x44555453` = "STUD") is data misdetected as code by heuristic discovery —
+   harmless stubs. A decode error in a *Ghidra-sourced* function is a real decoder gap.
+5. `dispatch_audit.missing_targets`: targets **inside** the loaded segment range are real —
+   each is a guaranteed LOOKUP_MISS if reached (cross-check against runtime LOOKUP_MISS
+   logs). Targets outside the segment range are artifacts of data words misdecoded as `j`
+   inside heuristically recovered functions (same root cause as the decode-error cluster).
+
+### Verified (2026-06-12, Patapon BOOT.BIN analysis.json)
+
+Full recompile with `PSPRECOMP_CROSS_MID=1`: counts matched the documented baseline
+(14,104 functions / 2,022 mid-entries / 283 batch files) and the expect flags passed;
+a deliberate `--expect-functions 99` run exited 1 with the mismatch error. The report
+contained the 4 known `FUN_089DBC*` decode errors among 1,830 total (1,829 from
+recompile-stage heuristic discovery decoding data, 1 from hle_scan). The dispatch audit
+found 346 missing targets — **all** at `0x02xxxxxx`, none inside the loaded segment
+(0x08804000–0x08ADC400): garbage `j`-targets decoded from data words, not real misses.
+Zero unresolved NIDs and zero relocations (Patapon is a relocation-free ELF; both paths
+exercised by unit tests instead).
+
 <!-- #38 dump single-function: section added by its implementation -->
