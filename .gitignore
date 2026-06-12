@@ -27,7 +27,7 @@ discovered_entries.json
 BOOT.BIN
 
 # Disc content (extracted ISO, large)
-disc0/
+disc0
 
 # Test artifacts
 *.tga

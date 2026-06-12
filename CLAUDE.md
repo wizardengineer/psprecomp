@@ -110,54 +110,18 @@ gen_callgraph("BOOT.BIN", "entry", "callees", 3)     # Call graph
 search_code("BOOT.BIN", "sceGe", 20, "literal")      # Code search
 ```
 
-## 6. Debugging Methodology
+## 6. Debugging
 
-### Debugging-First Mindset
+**All debugging methodology lives in [DEBUGGING.md](DEBUGGING.md)** — triage by symptom,
+lldb recipes, the oracle-driven differential method, the debug socket protocol, trace env
+flags, CLEANROOM verification gates, and known failure patterns. Read it before debugging
+anything; add new debugging knowledge there, not here.
 
-**Always use lldb before print statements.** The recompiled code is deterministic C++ — set targeted breakpoints, don't add fprintf sprinkle. Keep both `runtime/build/` (Release, for verification) and `runtime/build-debug/` (Debug, for investigation).
-
-**lldb quick reference:**
-```bash
-lldb ./runtime/build-debug/psprecomp_runtime
-(lldb) b FUN_0881E7A8                                    # Break on recompiled function
-(lldb) b hle_sceKernelCreateThread                       # Break on HLE stub
-(lldb) p/x ctx->r[2]                                    # Inspect v0
-(lldb) p/x ctx->r[4]                                    # Inspect a0
-(lldb) memory read rdram+(0x089F69B4&0x07FFFFFF) -c 32   # Read PSP memory (masked)
-(lldb) process interrupt                                 # Catch stall point
-(lldb) bt                                                # Backtrace
-(lldb) b FUN_0881E558 -c 'ctx->r[4] == 0x09000000'     # Conditional break
-(lldb) watchpoint set expression -- rdram+(0x089F69B4&0x07FFFFFF)  # Watch memory writes
-```
-
-**When to use lldb vs print tracing:**
-- **lldb:** Crashes, stalls, wrong branches, memory corruption, inspecting specific values
-- **PSPRECOMP_HLE_TRACE / PSPRECOMP_PC_TRACE:** Boot flow analysis, HLE call counting, hot function identification
-
-### Oracle-Driven Differential Debugging (the method for hard data/render bugs)
-
-For "wrong data / no output but no crash" bugs, lldb alone can't tell you what's *correct*. PPSSPP is a **scriptable behavioral oracle**, not just a passive compare:
-1. **Drive it**: launch GUI PPSSPP with the game image (debugger auto-listens; `lsof` for the port). Use `game.reset` to arm a breakpoint *before* a one-time boot event; `input.buttons.press` to advance menus — no macOS keystrokes needed. Some builds drop the `cpu.resume` reply — poll `cpu.status`, don't await resume.
-2. **Capture ground truth**: exec-bp a function to read its args; one-shot-bp the caller's `ra` to read its return value; **memory-write-bp a field to find what writes it** (e.g. who allocates a buffer).
-3. **Diff same-snapshot only**: compare PPSSPP vs runtime at the *same lifecycle instant*. **NEVER track an absolute heap address across boot phases** — addresses get reused; only within-snapshot diffs are trustworthy.
-4. **Don't grind the cascade**: if each fix only reveals the next layer, stop per-function patching. Use the oracle to find the *first* divergence, and independently verify the target before investing in a multi-layer fix.
-
-### Build Failures
-1. Generated code errors (`output/generated/batch_*.cpp`) -- fix in Rust emitter, regenerate: `cargo run --release -- recompile analysis.json -o output`
-2. Common emitter bugs: wrong register notation (`ctx->fN.fl` vs `ctx->f[N]`), missing `funcs.h` decls, stale files in `output/generated/`
-3. Runtime code errors (`runtime/src/`) -- fix directly
-
-### Linker Errors
-1. Undefined symbols -- check `funcs.h` matches batch function names
-2. Thunk naming -- emitter deduplicates with `_ADDR` suffixes; `dispatch.rs` and `batch.rs` must both use `name_overrides`
-3. Duplicate symbols -- check CMake glob; narrow to `batch_*.cpp` only
-
-### Runtime Crashes
-1. **LOOKUP_MISS** -- function not in dispatch table; check analysis.json
-2. **SIGSEGV** -- address masking issue; check within PSP_MEM_SIZE (128MB)
-3. **Hang** -- mid-entry dispatch; check `ctx->entry_point` set/cleared correctly
-4. Decompile with pyghidra: `decompile_function("BOOT.BIN", "0xCRASH_ADDR")`
-5. Compare with PPSSPP as behavioral oracle
+Quick anchors:
+- Crashes/stalls/wrong values → lldb on `runtime/build-debug/` (DEBUGGING.md §3, §5)
+- Wrong data/render, no crash → PPSSPP as scriptable oracle (DEBUGGING.md §4)
+- Verification runs → CLEANROOM gate (DEBUGGING.md §2); logs are multi-GB — timeout, grep, delete
+- Scripted input / memory reads → runtime debug socket on TCP 9999 (DEBUGGING.md §6)
 
 ## 7. Critical Rules
 
