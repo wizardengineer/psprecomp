@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -26,6 +27,7 @@ use psp_optimizer::{optimize, OptimizerConfig};
 use psp_parser::analysis_json::{AnalysisJson, JsonFunction, JsonMidEntry};
 
 use crate::config::{GameConfig, load_config};
+use crate::report::{self, DecodeErrorEntry, DiscoveryCounts};
 
 // -------------------------------------------------------------------------
 // Public entry points
@@ -74,16 +76,28 @@ pub fn run_dump(analysis_path: &Path, what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Options for [`run_recompile`] beyond the input/output paths.
+#[derive(Debug, Default)]
+pub struct RecompileOptions {
+    /// Optional TOML game config (stubs, skips, patches).
+    pub config_path: Option<std::path::PathBuf>,
+    /// Functions per generated .cpp file.
+    pub batch_size: usize,
+    /// If set, fail when the final function count differs (`--expect-functions`).
+    pub expect_functions: Option<usize>,
+    /// If set, fail when the final mid-entry count differs (`--expect-mid-entries`).
+    pub expect_mid_entries: Option<usize>,
+}
+
 /// Full recompile pipeline: analysis.json -> C++ project on disk.
 pub fn run_recompile(
     analysis_path: &Path,
     output_dir: &Path,
-    config_path: Option<&Path>,
-    batch_size_cli: usize,
+    opts: &RecompileOptions,
 ) -> anyhow::Result<()> {
     let mut analysis = load_analysis(analysis_path)?;
-    let config = load_config(config_path)?;
-    let effective_batch_size = config.functions_per_file.unwrap_or(batch_size_cli);
+    let config = load_config(opts.config_path.as_deref())?;
+    let effective_batch_size = config.functions_per_file.unwrap_or(opts.batch_size);
 
     tracing::info!("Loaded {} functions from {}", analysis.functions.len(), analysis_path.display());
 
@@ -98,9 +112,8 @@ pub fn run_recompile(
     tracing::info!("Decoded {} segments", segment_bytes.len());
 
     // Enhanced function discovery: three-pass scan replaces vtable_miss_addresses.txt sidecar
-    let enhanced = enhance_function_discovery(&mut analysis, &segment_bytes);
+    let discovery = enhance_function_discovery(&mut analysis, &segment_bytes);
     tracing::info!("Total functions after enhancement: {}", analysis.functions.len());
-    let _ = enhanced; // count already logged inside enhance_function_discovery
 
     // Force-inject mid-entries that Ghidra missed but are confirmed call targets
     // observed as repeated LOOKUP_MISS in the runtime. Mirrors FORCE_ENTRIES but
@@ -189,6 +202,11 @@ pub fn run_recompile(
     // Progress bar for function decode+emit
     let pb = make_progress_bar(analysis.functions.len() as u64);
 
+    // Silent-path collectors (issue #37): the rayon closure records every
+    // decode error and statically-emitted RECOMP_LOOKUP target for the report.
+    let decode_errors: Mutex<Vec<DecodeErrorEntry>> = Mutex::new(Vec::new());
+    let lookup_targets: Mutex<HashSet<u32>> = Mutex::new(HashSet::new());
+
     // Batch emit (parallel via rayon inside emit_function_batches)
     let batch_output = emit_function_batches(
         &analysis.functions,
@@ -202,10 +220,21 @@ pub fn run_recompile(
             // Option-A LINK/RA lowering (diagnostic isolating the two halves).
             let ra_off = std::env::var("PSPRECOMP_NO_RA_MODEL").as_deref() == Ok("1");
             let is_coalesced = !ra_off && coalesced_owners.contains(&func_addr);
-            decode_and_emit_function_with_name(
+            let (cpp, diag) = decode_and_emit_function_with_name(
                 func, &unique_name, &segment_bytes, &import_map, &func_map, &config, &data_xrefs,
                 &mid_entry_addr_map, is_coalesced,
-            )
+            );
+            if let Some(error) = diag.decode_error {
+                decode_errors.lock().unwrap().push(DecodeErrorEntry {
+                    address: func.address.clone(),
+                    name: func.name.clone(),
+                    error,
+                });
+            }
+            if !diag.static_lookup_targets.is_empty() {
+                lookup_targets.lock().unwrap().extend(diag.static_lookup_targets);
+            }
+            cpp
         },
         &unique_names,
     )?;
@@ -215,6 +244,24 @@ pub fn run_recompile(
     let module_name = &analysis.module_name;
     write_output_files(output_dir, &analysis, &batch_output, &mid_entries_cpp, module_name, &unique_names)?;
 
+    // Constructors are emitted as RECOMP_LOOKUP calls too (init_array.cpp) —
+    // include them in the static dispatch-target audit.
+    let mut static_lookup_targets = lookup_targets.into_inner().unwrap();
+    static_lookup_targets.extend(analysis.constructors.iter().filter_map(|c| parse_hex_u32(c)));
+
+    // Build + write recompile_report.json (issue #37).
+    let recompile_report = report::build_report(report::ReportInputs {
+        analysis: &analysis,
+        discovery,
+        batch_file_count: batch_output.cpp_files.len(),
+        decode_errors: decode_errors.into_inner().unwrap(),
+        static_lookup_targets,
+        unique_names: &unique_names,
+    });
+    let report_path = output_dir.join("recompile_report.json");
+    std::fs::write(&report_path, serde_json::to_string_pretty(&recompile_report)?)
+        .with_context(|| format!("Failed to write {}", report_path.display()))?;
+
     tracing::info!(
         "Recompile complete: {} functions, {} mid-entries, {} .cpp files -> {}",
         analysis.functions.len(),
@@ -222,6 +269,12 @@ pub fn run_recompile(
         batch_output.cpp_files.len(),
         output_dir.display(),
     );
+    println!("{}", report::human_summary(&recompile_report, &report_path));
+
+    // Self-checked counts (issue #37): turn the documented baseline into an
+    // assertion when the caller passes --expect-functions/--expect-mid-entries.
+    report::check_expectation("functions", analysis.functions.len(), opts.expect_functions)?;
+    report::check_expectation("mid-entries", analysis.mid_entries.len(), opts.expect_mid_entries)?;
     Ok(())
 }
 
@@ -249,11 +302,11 @@ fn segment_range(segment_bytes: &[(u32, Vec<u8>)]) -> (u32, u32) {
 /// This is an in-memory-only transformation -- analysis.json on disk is NOT
 /// modified.
 ///
-/// Returns the total number of new entries added.
+/// Returns the per-pass discovery breakdown (carried into the recompile report).
 fn enhance_function_discovery(
     analysis: &mut AnalysisJson,
     segment_bytes: &[(u32, Vec<u8>)],
-) -> usize {
+) -> DiscoveryCounts {
     // Fix stale heuristic placeholder sizes (vtable_miss / binary_scan) to their
     // true extent BEFORE the discovery passes run. Otherwise the gap-start and
     // prologue scans treat a truncated body's tail as empty space and inject
@@ -486,7 +539,13 @@ fn enhance_function_discovery(
         gap_count,
     );
 
-    discovered.len()
+    DiscoveryCounts {
+        force: force_count,
+        raw_scan: raw_scan_count,
+        prologue: prologue_count,
+        gap_start: gap_count,
+        gap_rescued: rescued_total,
+    }
 }
 
 /// Force-inject mid-entry addresses that Ghidra's analysis missed but the
@@ -1084,10 +1143,20 @@ fn get_func_bytes<'a>(
     })
 }
 
+/// Per-function emission diagnostics, consumed by the recompile report.
+#[derive(Debug, Default)]
+pub struct EmitDiagnostics {
+    /// Set when the function was stubbed because the decoder errored.
+    pub decode_error: Option<String>,
+    /// Statically-known cross-function RECOMP_LOOKUP targets emitted.
+    pub static_lookup_targets: Vec<u32>,
+}
+
 /// Decode and emit a single function to a C++ string, using an explicit (possibly deduplicated) name.
 ///
 /// Returns a stub body if bytes are unavailable or if the function is in
 /// config.skips / config.stubs. Applies config.patches before decode.
+/// The second tuple element carries silent-path diagnostics for the report.
 pub fn decode_and_emit_function_with_name(
     func: &JsonFunction,
     canonical_name: &str,
@@ -1098,26 +1167,27 @@ pub fn decode_and_emit_function_with_name(
     data_xrefs: &[(u32, u32)],
     mid_entry_addr_map: &HashMap<u32, Vec<u32>>,
     coalesced: bool,
-) -> String {
+) -> (String, EmitDiagnostics) {
+    let mut diag = EmitDiagnostics::default();
     let func_vaddr = match parse_hex_u32(&func.address) {
         Some(v) => v,
-        None => return make_stub_body(canonical_name, "// invalid address"),
+        None => return (make_stub_body(canonical_name, "// invalid address"), diag),
     };
     let func_size = func.size as u32;
     let cpp_name = psp_emitter::sanitize_identifier(canonical_name);
 
     // Check config.skips by address
     if config.skips.iter().any(|s| s.address == func.address) {
-        return make_stub_body(&cpp_name, "// skipped per game config");
+        return (make_stub_body(&cpp_name, "// skipped per game config"), diag);
     }
     // Check config.stubs by name
     if config.stubs.iter().any(|s| s.name == func.name) {
-        return make_stub_body(&cpp_name, "// HLE stub (name match in game config)");
+        return (make_stub_body(&cpp_name, "// HLE stub (name match in game config)"), diag);
     }
 
     let raw_bytes = match get_func_bytes(segments, func_vaddr, func_size) {
         Some(b) => b,
-        None => return make_stub_body(&cpp_name, "// bytes unavailable"),
+        None => return (make_stub_body(&cpp_name, "// bytes unavailable"), diag),
     };
 
     // Apply patches: build mutable copy and overwrite patched words
@@ -1128,7 +1198,8 @@ pub fn decode_and_emit_function_with_name(
         Ok(ops) => ops,
         Err(e) => {
             tracing::warn!("Decode error in {} @ 0x{:08X}: {e}", func.name, func_vaddr);
-            return make_stub_body(&cpp_name, &format!("// decode error: {e}"));
+            diag.decode_error = Some(e.to_string());
+            return (make_stub_body(&cpp_name, &format!("// decode error: {e}")), diag);
         }
     };
 
@@ -1148,7 +1219,8 @@ pub fn decode_and_emit_function_with_name(
 
     let mut gen = CppGenerator::new();
     psp_emitter::function::emit_function(&decoded, &mut gen, import_map);
-    gen.take_output()
+    diag.static_lookup_targets = gen.take_static_lookup_targets();
+    (gen.take_output(), diag)
 }
 
 /// Emit an empty stub function body with a comment.
@@ -1304,4 +1376,59 @@ fn remove_stale_batch_files(gen_dir: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn emit_with_words(words: &[u32]) -> (String, EmitDiagnostics) {
+        let base = 0x0880_4000u32;
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let func = JsonFunction {
+            name: "FUN_08804000".into(),
+            address: format!("0x{base:08X}"),
+            size: bytes.len() as u64,
+            is_external: false,
+            is_thunk: false,
+            source: "ghidra".into(),
+        };
+        let segments = vec![(base, bytes)];
+        decode_and_emit_function_with_name(
+            &func,
+            "FUN_08804000",
+            &segments,
+            &HashMap::new(),
+            &HashMap::new(),
+            &GameConfig::default(),
+            &[],
+            &HashMap::new(),
+            false,
+        )
+    }
+
+    #[test]
+    fn decode_error_is_surfaced_in_diagnostics() {
+        // Opcode 0x10 (COP0) with rs_field 0x10 has no decoding — guaranteed
+        // DecodeError::Unknown, the silent stub path issue #37 aggregates.
+        let (cpp, diag) = emit_with_words(&[0x4200_0000, 0x0000_0000]);
+        let err = diag.decode_error.expect("decoder must report an error");
+        assert!(cpp.contains("decode error"), "stub body must carry the error comment");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn clean_decode_has_no_error_and_records_lookup_targets() {
+        // jal 0x08900000 (cross-function) + nop delay slot + jr ra + nop.
+        let jal = 0x0C00_0000 | ((0x0890_0000 >> 2) & 0x03FF_FFFF);
+        let jr_ra = 0x03E0_0008;
+        let (cpp, diag) = emit_with_words(&[jal, 0, jr_ra, 0]);
+        assert!(diag.decode_error.is_none());
+        assert!(
+            diag.static_lookup_targets.contains(&0x0890_0000),
+            "cross-function jal must be recorded for the dispatch audit; got {:?}",
+            diag.static_lookup_targets,
+        );
+        assert!(cpp.contains("RECOMP_LOOKUP(0x08900000)"));
+    }
 }

@@ -2,6 +2,7 @@ mod analyze;
 mod config;
 mod hle_entry_scanner;
 mod recompile;
+mod report;
 
 use clap::{Parser, Subcommand};
 
@@ -41,6 +42,12 @@ enum Commands {
         /// Functions per .cpp file (default: 50)
         #[arg(long, default_value_t = 50usize)]
         batch_size: usize,
+        /// Fail (exit nonzero) unless the final function count equals N
+        #[arg(long)]
+        expect_functions: Option<usize>,
+        /// Fail (exit nonzero) unless the final mid-entry count equals N
+        #[arg(long)]
+        expect_mid_entries: Option<usize>,
     },
     /// Dump selected fields from analysis.json to stdout
     Dump {
@@ -64,14 +71,22 @@ fn main() -> anyhow::Result<()> {
                 .init();
             crate::analyze::run_analyze(&binary, &output, ghidra_dir.as_ref(), &nid_db)?;
         }
-        Commands::Recompile { analysis, output, config, batch_size } => {
+        Commands::Recompile {
+            analysis, output, config, batch_size, expect_functions, expect_mid_entries,
+        } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::from_default_env()
                         .add_directive(tracing::Level::INFO.into()),
                 )
                 .init();
-            crate::recompile::run_recompile(&analysis, &output, config.as_deref(), batch_size)?;
+            let opts = crate::recompile::RecompileOptions {
+                config_path: config,
+                batch_size,
+                expect_functions,
+                expect_mid_entries,
+            };
+            crate::recompile::run_recompile(&analysis, &output, &opts)?;
         }
         Commands::Dump { analysis, what } => {
             crate::recompile::run_dump(&analysis, &what)?;
