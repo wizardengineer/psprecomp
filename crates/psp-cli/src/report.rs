@@ -328,7 +328,8 @@ pub fn check_expectation(kind: &str, actual: usize, expected: Option<usize>) -> 
 }
 
 /// Current UTC time as ISO-8601 ("YYYY-MM-DDTHH:MM:SSZ"), no external deps.
-fn iso8601_utc_now() -> String {
+/// Shared with the build fingerprint (issue #36).
+pub fn iso8601_utc_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

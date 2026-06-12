@@ -1,6 +1,7 @@
 mod analyze;
 mod config;
 mod dump;
+mod fingerprint;
 mod hle_entry_scanner;
 mod recompile;
 mod report;

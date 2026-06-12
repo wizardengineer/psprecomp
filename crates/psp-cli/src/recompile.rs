@@ -27,6 +27,7 @@ use psp_optimizer::{optimize, OptimizerConfig};
 use psp_parser::analysis_json::{AnalysisJson, JsonFunction, JsonMidEntry};
 
 use crate::config::{GameConfig, load_config};
+use crate::fingerprint;
 use crate::report::{self, DecodeErrorEntry, DiscoveryCounts};
 
 // -------------------------------------------------------------------------
@@ -305,6 +306,20 @@ pub fn run_recompile(
     let report_path = output_dir.join("recompile_report.json");
     std::fs::write(&report_path, serde_json::to_string_pretty(&recompile_report)?)
         .with_context(|| format!("Failed to write {}", report_path.display()))?;
+
+    // Build fingerprint (issue #36): identifies the emitter sources, analysis
+    // input, and codegen-relevant flags this output/ was generated from, so
+    // the runtime's configure step can fail fast on staleness.
+    let fp = fingerprint::build_fingerprint(fingerprint::FingerprintInputs {
+        analysis_path,
+        cross_mid: std::env::var("PSPRECOMP_CROSS_MID").as_deref() == Ok("1"),
+        counts: fingerprint::FingerprintCounts {
+            functions: analysis.functions.len(),
+            mid_entries: analysis.mid_entries.len(),
+            batch_files: batch_output.cpp_files.len(),
+        },
+    });
+    fingerprint::write_outputs(output_dir, &fp)?;
 
     tracing::info!(
         "Recompile complete: {} functions, {} mid-entries, {} .cpp files -> {}",
