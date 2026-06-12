@@ -21,6 +21,7 @@ the PSP Graphics Engine to OpenGL 3.3.
 
 - [Overview](#overview)
 - [Pipeline](#pipeline)
+- [Why Ghidra?](#why-ghidra)
 - [Current Status](#current-status)
 - [Building and Running](#building-and-running)
 - [Verification Methodology](#verification-methodology)
@@ -53,6 +54,37 @@ flowchart LR
     D -->|SDL2 + OpenGL 3.3| G[Window]
 ```
 
+## Why Ghidra?
+
+A static recompiler must know where every function begins and ends **before** it decodes
+anything — and a retail PSP binary doesn't say. BOOT.BIN is stripped: no symbol table, no
+function boundaries, just a flat region of MIPS instructions and data. Simply decoding from the
+entry point and following calls is not enough, because much of the code is only reachable
+indirectly (C++ vtables, function-pointer tables, thread entry points, callbacks registered with
+the OS).
+
+Ghidra solves exactly that one problem. The `analyze` step runs Ghidra's headless auto-analysis
+— a mature, battle-tested function-discovery engine — over the binary, and the
+[`analysis/ExtractAnalysis.java`](analysis/ExtractAnalysis.java) script exports the results to
+`analysis.json`: function entry points and sizes, mid-function entry points, cross-references,
+and jump-table hints. For Patapon that census is ~9,700 functions.
+
+Two things follow from this design:
+
+- **Ghidra is needed once per binary.** After `analysis.json` exists, the `recompile` step and
+  the runtime never touch Ghidra again. It is an analysis-time tool, not a runtime dependency —
+  everything downstream (the decoder, the C++ emitter, the entire runtime) is this project's own
+  code.
+- **Ghidra's census is treated as a starting point, not ground truth.** Auto-analysis misses
+  functions (no inbound xrefs, data-driven dispatch), so the pipeline supplements it: forced
+  mid-entry injection and cross-function mid-jump discovery recover targets that surface at
+  runtime as dispatch-table misses.
+
+The PSP's CPU (Allegrex) is a MIPS32 variant with custom instructions and a vector unit (VFPU)
+that stock Ghidra does not understand, so the
+[ghidra-allegrex](https://github.com/kotcrab/ghidra-allegrex) processor extension is required —
+see [Prerequisites](#prerequisites-macos--homebrew).
+
 ## Current Status
 
 **As of 2026-06-10: the game boots and renders the PATAPON title screen** — logo, NEW
@@ -82,9 +114,18 @@ Recent work that got it there (merged via PR #17):
 brew install cmake sdl2 pkg-config ghidra
 ```
 
-Rust (stable), CMake 3.16+, SDL2 (found via pkg-config), a C++17 compiler, OpenGL 3.3, and
-Ghidra 12.0.2 (analyze step only). You also need Patapon's BOOT.BIN and the extracted ISO
-content (`disc0/`).
+- **Rust** (stable) and a **C++17 compiler**; CMake 3.16+, SDL2 (found via pkg-config), OpenGL 3.3.
+- **Ghidra 12.x** — used by the `analyze` step only (see [Why Ghidra?](#why-ghidra)).
+- **[ghidra-allegrex](https://github.com/kotcrab/ghidra-allegrex)** — Ghidra processor extension
+  for the PSP's Allegrex CPU. Install it into your Ghidra (Ghidra GUI: *File → Install
+  Extensions*, or unzip into the install dir); the analyze step verifies that
+  `<ghidra-install>/Ghidra/Processors/Allegrex` exists and refuses to run without it.
+
+You must also provide, from your own copy of the game (no game data is included in or
+distributed with this repository):
+
+- `BOOT.BIN` — the game executable, from `PSP_GAME/SYSDIR/` on the disc.
+- `disc0/` — the extracted ISO contents (assets the game loads at runtime).
 
 ### Full pipeline
 
@@ -93,10 +134,10 @@ content (`disc0/`).
 cargo build --release
 cargo test
 
-# 2. Analyze the binary (requires Ghidra)
-cargo run --release -- analyze --ghidra-dir <ghidra-install>/libexec  # e.g. $(brew --prefix ghidra)/libexec on macOS BOOT.BIN
+# 2. Analyze the binary -> analysis.json (requires Ghidra + ghidra-allegrex; once per binary)
+cargo run --release -- analyze --ghidra-dir "$(brew --prefix ghidra)/libexec" BOOT.BIN
 
-# 3. Generate C++ source (PSPRECOMP_CROSS_MID=1 is required)
+# 3. Generate C++ source from analysis.json (PSPRECOMP_CROSS_MID=1 is required)
 PSPRECOMP_CROSS_MID=1 cargo run --release -- recompile analysis.json -o output
 
 # 4. Build the runtime
