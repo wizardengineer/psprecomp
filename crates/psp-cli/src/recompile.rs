@@ -314,8 +314,8 @@ pub fn run_recompile(
         analysis_path,
         cross_mid: std::env::var("PSPRECOMP_CROSS_MID").as_deref() == Ok("1"),
         counts: fingerprint::FingerprintCounts {
-            functions: analysis.functions.len(),
-            mid_entries: analysis.mid_entries.len(),
+            functions: prep.analysis.functions.len(),
+            mid_entries: prep.analysis.mid_entries.len(),
             batch_files: batch_output.cpp_files.len(),
         },
     });
