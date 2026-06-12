@@ -37,8 +37,13 @@ pub fn run_dump_function(
     let addr = parse_dump_address(addr_arg)?;
     let prep = prepare_emission(analysis_path, config_path)?;
     let cpp = emit_function_cpp(&prep, addr)?;
-    print!("{cpp}");
-    Ok(())
+    // write_all instead of print!: a downstream consumer exiting early (e.g.
+    // `| head`) must end the dump quietly, not panic on EPIPE.
+    use std::io::Write;
+    match std::io::stdout().lock().write_all(cpp.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
 }
 
 /// Parse the address argument: hex, case-insensitive, `0x` prefix optional.

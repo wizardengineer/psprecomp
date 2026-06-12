@@ -4,9 +4,48 @@ use goblin::elf::program_header::PT_LOAD;
 
 /// Parse an ELF/PRX binary from raw bytes.
 ///
-/// Returns the parsed goblin Elf struct.
+/// Returns the parsed goblin Elf struct. Two common non-ELF inputs from real
+/// game dumps get actionable errors instead of a cryptic bad-magic failure
+/// (found bringing up an untested game, issue #37 spirit): the `~PSP`
+/// encrypted-executable header, and all-zero dummy BOOT.BIN placeholders.
 pub fn parse_elf(data: &[u8]) -> Result<goblin::elf::Elf<'_>, ParseError> {
+    if data.starts_with(b"~PSP") {
+        return Err(ParseError::EncryptedPsp);
+    }
+    if data.len() >= 64 && data[..64].iter().all(|&b| b == 0) {
+        return Err(ParseError::DummyZeroes);
+    }
     Ok(goblin::elf::Elf::parse(data)?)
+}
+
+#[cfg(test)]
+mod parse_guard_tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_psp_magic_gets_actionable_error() {
+        let mut data = b"~PSP".to_vec();
+        data.resize(256, 0xAA);
+        let err = parse_elf(&data).unwrap_err();
+        assert!(matches!(err, ParseError::EncryptedPsp));
+        assert!(err.to_string().contains("encrypted ~PSP"));
+    }
+
+    #[test]
+    fn all_zero_dummy_gets_actionable_error() {
+        let data = vec![0u8; 4096];
+        let err = parse_elf(&data).unwrap_err();
+        assert!(matches!(err, ParseError::DummyZeroes));
+        assert!(err.to_string().contains("dummy"));
+    }
+
+    #[test]
+    fn real_elf_magic_still_reaches_goblin() {
+        // \x7fELF but truncated: must NOT hit the guards; goblin reports it.
+        let data = b"\x7fELF".to_vec();
+        let err = parse_elf(&data).unwrap_err();
+        assert!(matches!(err, ParseError::Elf(_)));
+    }
 }
 
 /// Extract all PT_LOAD segments. BSS region (p_memsz > p_filesz) is zeroed.
