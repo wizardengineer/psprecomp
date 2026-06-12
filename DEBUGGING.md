@@ -345,4 +345,46 @@ found 346 missing targets — **all** at `0x02xxxxxx`, none inside the loaded se
 Zero unresolved NIDs and zero relocations (Patapon is a relocation-free ELF; both paths
 exercised by unit tests instead).
 
-<!-- #38 dump single-function: section added by its implementation -->
+## #38 — `dump <analysis.json> 0xADDR` (single-function C++ emission)
+
+Emits exactly one function's generated C++ to stdout — no full recompile, no grepping
+batch files, no writes under `output/`. The list modes are unchanged
+(`dump analysis.json functions|imports|relocations|segments|mid_entries`, positional or
+`--what`; default `functions`).
+
+```bash
+# Module start (named "entry" in emitter output)
+PSPRECOMP_CROSS_MID=1 cargo run --release -- dump analysis.json 0x089ACCD0
+
+# Ordinary function; 0x prefix optional, hex case-insensitive
+PSPRECOMP_CROSS_MID=1 cargo run --release -- dump analysis.json 0881e7a8 > /tmp/f.cpp
+
+# Mid-entry address -> actionable error on stderr, exit 1:
+#   Error: 0x08804CE8 is a mid-entry inside FUN_08804a4c (entry 0x08804A4C); ...
+#   dump the parent: psprecomp dump <analysis.json> 0x08804A4C
+cargo run --release -- dump analysis.json 0x08804CE8
+```
+
+Address resolution is against the **post-pipeline** function list (after discovery,
+force-injection, and the CROSS_MID passes). Non-entry addresses never silently emit the
+wrong thing: a registered mid-entry names its parent; an address strictly inside a body
+names the containing function; an unknown address lists the nearest entries below/above;
+bad hex is a usage error. Errors and all tracing go to stderr — stdout carries only C++,
+so it pipes/redirects cleanly.
+
+**Fidelity / CROSS_MID note:** the dump goes through the same `prepare_emission` +
+`emit_one_function` path as the batch emitter (same IR, same global `_ADDR` name dedup,
+same mid-entry dispatch), so its output is **byte-identical** to the function's text in
+its `batch_*.cpp` for the same flag set. That means `PSPRECOMP_CROSS_MID` (and
+`PSPRECOMP_NO_COALESCE`/`PSPRECOMP_NO_RA_MODEL`, and `--config`) must match whatever the
+`output/` you are comparing against was generated with — CROSS_MID changes coalescing and
+mid-entries, which changes bodies. Pipeline prep takes a few seconds (it re-runs discovery,
+and under CROSS_MID the coalesce/recovery decode passes) before the single function emits.
+
+**How verified:** unit tests in `crates/psp-cli/src/dump.rs` compare the dump path against
+in-memory batch emission for the real analysis.json (entry, an ordinary `FUN_`, a mid-entry
+parent, an `_ADDR`-deduplicated thunk — all byte-identical substrings), plus end-to-end CLI
+runs with `PSPRECOMP_CROSS_MID=1` on both sides: dumps of `entry` (0x089ACCD0, 4052 bytes),
+mid-entry parent `FUN_08804a4c` (11637 bytes), dedup `thunk_FUN_08864f98_0887f1c4`, and
+`FUN_0881e7a8` were each exact byte substrings of their `output/generated/batch_*.cpp`,
+with the recompile baseline (14104/2022/283) unchanged.

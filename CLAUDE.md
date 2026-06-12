@@ -94,7 +94,8 @@ cmake --build runtime/build-debug -j$(sysctl -n hw.ncpu)
 PSPRECOMP_STRICT=1 ./runtime/build/psprecomp_runtime                 # Abort on LOOKUP_MISS
 lldb ./runtime/build-debug/psprecomp_runtime                         # Debug session
 
-# Dump single function's emitted C++
+# Dump single function's emitted C++ (byte-identical to its batch file; set
+# PSPRECOMP_CROSS_MID=1 to match an output/ generated with it — see DEBUGGING.md #38)
 cargo run --release -- dump analysis.json 0xADDRESS
 ```
 
