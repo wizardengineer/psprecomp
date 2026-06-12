@@ -88,8 +88,20 @@ int main(int argc, char* argv[]) {
         "[RT] Memory initialized (%zu MB)\n",
         PSP_MEM_SIZE / (1024 * 1024));
 
-    // 2b. Start TCP debug socket (loopback port 9999) for external memory reads
+    // 2b. Start TCP debug socket (loopback port 9999) for external memory
+    //     reads/writes, info queries, button injection, and screenshots.
+    //     The hooks give the I and S commands read-only views into the GE,
+    //     dispatch, and scheduler subsystems (issue #35).
     psp_debug_socket_start(rdram, PSP_MEM_SIZE, 9999);
+    {
+        PspDebugHooks hooks;
+        hooks.ge_stats           = ge_draw_get_stats;
+        hooks.lookup_miss_stats  = psp_dispatch_get_miss_stats;
+        hooks.recent_funcs       = psp_dispatch_get_recent_funcs;
+        hooks.thread_list        = psp_scheduler_snapshot;
+        hooks.capture_screenshot = ge_draw_capture_screenshot;
+        psp_debug_socket_set_hooks(hooks);
+    }
 
     // 3. Populate dispatch table (must be before any RECOMP_LOOKUP)
     psp_init_dispatch_table();
