@@ -66,8 +66,13 @@ PSPRECOMP_CROSS_MID=1 PSPRECOMP_CLEANROOM=1 timeout 120 \
 
 **Stale-output trap:** `output/` is gitignored. After ANY emitter change you MUST
 regenerate (`recompile`) before building the runtime, and `PSPRECOMP_CROSS_MID=1` must be
-set at recompile time. Symptom of staleness: measurements that contradict the code you just
-changed. (Issue #36 adds fingerprint checking for this.)
+set at recompile time. This check is now **mechanical** (issue #36): the runtime's CMake
+configure step diffs `output/fingerprint.json` against the live emitter sources and fails
+with the regeneration command on mismatch; every run log starts with the
+`[RT] output fingerprint:` line including the cross_mid flag (see "#36 — build
+fingerprinting" below). Symptom of slipping past it (`-DPSPRECOMP_ALLOW_STALE=ON`, or a
+build dir configured before the staleness appeared): measurements that contradict the code
+you just changed — re-run a bare `cmake -B runtime/build -S runtime` to re-check.
 
 ## 3. Triage by symptom
 
@@ -271,7 +276,75 @@ round-trip, masking, JSON shape + hostile-name escaping, two concurrent clients,
 line) plus a live run against Patapon — `I` during boot and at title, `W`+`R` round-trip at
 `0x09FFFF00`, `S` produced the actual 480x272 title-screen TGA mid-run, `B 4000 250` → `OK 0`,
 malformed commands → ERR, two simultaneous `nc` sessions served concurrently.
-<!-- #36 build fingerprinting: section added by its implementation -->
+## #36 — build fingerprinting (stale-output detection)
+
+Every `psprecomp recompile` writes `<output>/fingerprint.json` and
+`<output>/include/recomp_fingerprint.h`. The runtime's CMake configure step verifies the
+fingerprint; the runtime prints it at boot. Together they make the stale-output trap (§2)
+mechanical instead of procedural.
+
+### What the fingerprint covers
+
+- **Emitter sources** (`emitter_sources_hash`): content hash over every `*.rs` under
+  `crates/psp-emitter/src`, `crates/psp-decoder/src`, `crates/psp-ir/src`,
+  `crates/psp-optimizer/src`, plus the psp-cli files that shape emission
+  (`recompile.rs`, `config.rs`, `hle_entry_scanner.rs`). Content hashing catches
+  **uncommitted** edits — a git commit hash cannot.
+- **analysis.json**: SHA-256 of the input file's bytes (re-analyze without recompile is
+  also stale).
+- **Flags**: `cross_mid` — whether `PSPRECOMP_CROSS_MID=1` was set at recompile time
+  (previously invisible after the fact).
+- **Context** (not hashed): ISO-8601 timestamp, git commit + dirty flag, headline counts
+  (functions / mid-entries / batch files).
+
+**NOT covered:** `runtime/` sources (CMake rebuilds those itself), the NID database, game
+config TOMLs passed via `--config`, and Cargo dependency versions (`cargo update` that
+changes codegen is invisible). A stale **build dir** configured before the staleness
+appeared also escapes until the next configure — `cmake --build` alone does not re-check.
+
+### Hash recipe (v1) and why content hashes are listed per file
+
+Per-file SHA-256 of raw bytes; combined hash = SHA-256 over `"{path}\n{hash}\n"` sorted by
+repo-root-relative path. Deterministic: same trees → same hash; timestamps and git state do
+not feed it. fingerprint.json embeds the **full per-file list**, and the configure check
+recomputes hashes for exactly those files — so the Rust and Python sides can never disagree
+about the file set. The recipe roots are embedded too, so files *added* after the recompile
+are still detected. Authoritative recipe doc: module header of
+`crates/psp-cli/src/fingerprint.rs`; mirror: `runtime/cmake/check_fingerprint.py`.
+
+### Boot line (grep-stable, first line of every run log)
+
+```
+[RT] output fingerprint: <sha256> (cross_mid=1, recompiled 2026-06-12T06:18:21Z)
+```
+
+`unavailable (output/ predates issue #36)` appears for pre-fingerprint output dirs.
+
+### Configure-time check, failure message, override
+
+On mismatch, `cmake -B runtime/build -S runtime` fails with:
+
+```
+output/ is stale relative to the emitter sources — run:
+    PSPRECOMP_CROSS_MID=1 cargo run --release -- recompile analysis.json -o output
+STALE: emitter sources changed since output/ was recompiled (recorded <hash>..., actual <hash>...)
+  changed: crates/psp-emitter/src/lib.rs
+```
+
+Override with `-DPSPRECOMP_ALLOW_STALE=ON` → configures with a loud warning instead.
+**The option is cached** — pass `-DPSPRECOMP_ALLOW_STALE=OFF` to re-arm an existing build
+dir. Missing `fingerprint.json` (pre-#36 output dirs) and unverifiable states (sources not
+on disk at recompile time, missing Python3) are warnings, never errors.
+
+### Verified (2026-06-12, Patapon BOOT.BIN)
+
+Fresh recompile → configure printed `output/ fingerprint OK`, build + boot printed the
+banner. Appending a comment to `crates/psp-emitter/src/lib.rs` without recompiling →
+configure exited 1 with the message above naming the file; `-DPSPRECOMP_ALLOW_STALE=ON` →
+exit 0 with the warning; revert + recompile → `fingerprint OK` with the **identical**
+combined hash (determinism). Removing fingerprint.json → warning, configure + build OK.
+
+
 ## #37 — recompile_report.json (silent-path audit)
 
 Every `psprecomp recompile` run writes `<output>/recompile_report.json` and prints a
