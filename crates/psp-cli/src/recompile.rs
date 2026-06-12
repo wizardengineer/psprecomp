@@ -89,23 +89,33 @@ pub struct RecompileOptions {
     pub expect_mid_entries: Option<usize>,
 }
 
-/// Full recompile pipeline: analysis.json -> C++ project on disk.
-pub fn run_recompile(
+/// Everything the per-function emit closure consumes, computed once from
+/// analysis.json. Shared by [`run_recompile`] and the single-function dump
+/// (`crate::dump`) so both paths run the exact same pipeline (discovery,
+/// force mid-entries, PSPRECOMP_CROSS_MID passes, name dedup) and therefore
+/// produce byte-identical C++ for any given function.
+pub(crate) struct PreparedEmission {
+    pub(crate) analysis: AnalysisJson,
+    pub(crate) config: GameConfig,
+    pub(crate) segment_bytes: Vec<(u32, Vec<u8>)>,
+    pub(crate) discovery: DiscoveryCounts,
+    pub(crate) coalesced_owners: HashSet<u32>,
+    pub(crate) import_map: HashMap<u32, String>,
+    pub(crate) func_map: HashMap<u32, String>,
+    pub(crate) unique_names: HashMap<u32, String>,
+    pub(crate) mid_entry_addr_map: HashMap<u32, Vec<u32>>,
+    pub(crate) data_xrefs: Vec<(u32, u32)>,
+}
+
+/// Load analysis.json and run every in-memory transformation that precedes
+/// batch emission. Read-only with respect to the filesystem.
+pub(crate) fn prepare_emission(
     analysis_path: &Path,
-    output_dir: &Path,
-    opts: &RecompileOptions,
-) -> anyhow::Result<()> {
+    config_path: Option<&Path>,
+) -> anyhow::Result<PreparedEmission> {
     let mut analysis = load_analysis(analysis_path)?;
-    let config = load_config(opts.config_path.as_deref())?;
-    let effective_batch_size = config.functions_per_file.unwrap_or(opts.batch_size);
-
+    let config = load_config(config_path)?;
     tracing::info!("Loaded {} functions from {}", analysis.functions.len(), analysis_path.display());
-
-    // Prepare output directories
-    let gen_dir = output_dir.join("generated");
-    let inc_dir = output_dir.join("include");
-    std::fs::create_dir_all(&gen_dir)?;
-    std::fs::create_dir_all(&inc_dir)?;
 
     // Decode segment bytes from base64 (before enhancement -- prologue scan needs raw bytes)
     let segment_bytes = decode_segment_bytes(&analysis);
@@ -120,29 +130,16 @@ pub fn run_recompile(
     // for mid-function entry points inside an existing parent function.
     inject_force_mid_entries(&mut analysis);
 
-    // Systematic recovery of cross-function mid-jump targets (D3a, 19G/19H).
-    // Re-decode every function with the emitter's own decode+optimize pipeline,
-    // find every static branch/jump target that lands strictly inside a DIFFERENT
-    // function, and register it as a mid-entry of its owning function. The emitter
-    // turns such targets into `RECOMP_LOOKUP(target)`; without a dispatch entry
-    // they fall through to `noop_stub` and the control transfer is silently
-    // dropped (the LOOKUP_MISS class). With the re-entrant entry_point mechanism
-    // (faithful, see 19H) this is safe at scale.
-    //
-    // GATED OFF by default (D1 baseline). The entry_point mechanism fix in
-    // crates/psp-emitter/src/function.rs is verified correct (no contamination,
-    // eliminates the 0x089D7xxx + 0x08827470 LOOKUP_MISS class entirely — see
-    // 19H §"VERIFY"). But landing this pass + the D2 thunks makes the BROKEN
-    // decompressor at 0x089D7xxx RUN, and it stalls the per-asset SM at state 300
-    // (the D3 inflate-destination-heap wall, doc-20). That regresses the boot
-    // below the D1 baseline (5 display lists vs ~1170 GE clears), so per the
-    // anti-cascade rule it is NOT shipped this session. Enable with
-    // PSPRECOMP_CROSS_MID=1 to land D2+D3a once D3 (the inflate heap) is fixed.
-    // Coalesce owners: Ghidra-over-split shared-frame siblings merged into one
-    // emitted C++ function. Populated only under CROSS_MID. Threaded to the emit
-    // closure so the emitter applies the Option-A LINK/RA model to these owners.
+    // PSPRECOMP_CROSS_MID=1: coalesce Ghidra-over-split shared-frame siblings,
+    // then run systematic cross-function mid-jump recovery (D2+D3a, 19G/19H).
+    // GATED OFF by default (D1 baseline): landing it makes the BROKEN
+    // decompressor at 0x089D7xxx RUN and stall at the D3 inflate-heap wall,
+    // regressing the boot below the D1 baseline — see the doc comments on
+    // `coalesce_split_frame_siblings` / `inject_cross_function_mid_jumps`.
+    // Coalesce owners are threaded to the emit closure so the emitter applies
+    // the Option-A LINK/RA model to them. PSPRECOMP_NO_COALESCE=1 disables
+    // the merge only (A/B diagnostic).
     let mut coalesced_owners: HashSet<u32> = HashSet::new();
-
     if std::env::var("PSPRECOMP_CROSS_MID").as_deref() == Ok("1") {
         // DATA xrefs are needed for the decoder's jump-table promotion so the
         // re-decode matches the emitter's exact op stream.
@@ -150,10 +147,6 @@ pub fn run_recompile(
             .filter(|x| x.ref_type == "DATA")
             .filter_map(|x| Some((parse_hex_u32(&x.from_addr)?, parse_hex_u32(&x.to_addr)?)))
             .collect();
-        // Merge Ghidra-over-split shared-frame siblings BEFORE cross-function
-        // mid-jump recovery, so cross-piece branches become intra-function gotos
-        // and the owner's internal jal/jr are modeled by the Option-A RA pass.
-        // PSPRECOMP_NO_COALESCE=1 disables the merge (A/B diagnostic).
         if std::env::var("PSPRECOMP_NO_COALESCE").as_deref() != Ok("1") {
             coalesced_owners =
                 coalesce_split_frame_siblings(&mut analysis, &segment_bytes, &data_xrefs_pre);
@@ -161,34 +154,25 @@ pub fn run_recompile(
         inject_cross_function_mid_jumps(&mut analysis, &segment_bytes, &data_xrefs_pre);
     }
 
-    // Build lookup maps
+    // Lookup maps consumed by decode_and_emit_function_with_name.
+    // Name dedup: Ghidra may produce multiple functions with the same name at
+    // different addresses (e.g. thunk_FUN_xxx); collisions get _ADDR suffixes.
     let import_map = build_import_map(&analysis.imports);
-    // Deduplicate function names: Ghidra may produce multiple functions with the same
-    // name at different addresses (e.g. thunk_FUN_xxx). Append _ADDR suffix to collisions.
     let unique_names = dedup_function_names(&analysis.functions);
     let func_map = build_func_map(&analysis.functions);
 
-    // Emit mid-entry wrappers
-    let parent_name_map = build_parent_name_map(&analysis.functions);
-    let (mid_entries_cpp, mid_entry_fwd_decls) =
-        emit_mid_entry_wrappers(&analysis.mid_entries, &parent_name_map);
-    tracing::info!("Emitting {} mid-entry wrappers", analysis.mid_entries.len());
-
-    // Build mid-entry address map: parent_addr -> Vec<mid_entry_addr>
-    let mid_entry_addr_map: HashMap<u32, Vec<u32>> = {
-        let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
-        for me in &analysis.mid_entries {
-            let entry_addr = parse_hex_u32(&me.addr).unwrap_or(0);
-            let parent_addr = parse_hex_u32(&me.parent_addr).unwrap_or(0);
-            if entry_addr != 0 && parent_addr != 0 {
-                map.entry(parent_addr).or_default().push(entry_addr);
-            }
+    // Mid-entry address map: parent_addr -> Vec<mid_entry_addr>
+    let mut mid_entry_addr_map: HashMap<u32, Vec<u32>> = HashMap::new();
+    for me in &analysis.mid_entries {
+        let entry_addr = parse_hex_u32(&me.addr).unwrap_or(0);
+        let parent_addr = parse_hex_u32(&me.parent_addr).unwrap_or(0);
+        if entry_addr != 0 && parent_addr != 0 {
+            mid_entry_addr_map.entry(parent_addr).or_default().push(entry_addr);
         }
-        map
-    };
+    }
     tracing::info!("Built mid-entry addr map: {} parent functions", mid_entry_addr_map.len());
 
-    // Build DATA xref table: (from_addr, to_addr) pairs for jump table detection
+    // DATA xref table: (from_addr, to_addr) pairs for jump table detection
     let data_xrefs: Vec<(u32, u32)> = analysis.xrefs.iter()
         .filter(|x| x.ref_type == "DATA")
         .filter_map(|x| {
@@ -199,8 +183,74 @@ pub fn run_recompile(
         .collect();
     tracing::info!("Loaded {} DATA xrefs for jump table detection", data_xrefs.len());
 
+    Ok(PreparedEmission {
+        analysis,
+        config,
+        segment_bytes,
+        discovery,
+        coalesced_owners,
+        import_map,
+        func_map,
+        unique_names,
+        mid_entry_addr_map,
+        data_xrefs,
+    })
+}
+
+/// Decode + emit exactly one function the way the batch closure does.
+///
+/// This is THE per-function emission path: `run_recompile`'s batch closure
+/// and the single-function dump both call it, so their output is identical.
+pub(crate) fn emit_one_function(
+    prep: &PreparedEmission,
+    func: &JsonFunction,
+) -> (String, EmitDiagnostics) {
+    let func_addr = parse_hex_u32(&func.address).unwrap_or(0);
+    let unique_name = prep
+        .unique_names
+        .get(&func_addr)
+        .cloned()
+        .unwrap_or_else(|| func.name.clone());
+    // PSPRECOMP_NO_RA_MODEL=1 keeps the structural merge but disables the
+    // Option-A LINK/RA lowering (diagnostic isolating the two halves).
+    let ra_off = std::env::var("PSPRECOMP_NO_RA_MODEL").as_deref() == Ok("1");
+    let is_coalesced = !ra_off && prep.coalesced_owners.contains(&func_addr);
+    decode_and_emit_function_with_name(
+        func,
+        &unique_name,
+        &prep.segment_bytes,
+        &prep.import_map,
+        &prep.func_map,
+        &prep.config,
+        &prep.data_xrefs,
+        &prep.mid_entry_addr_map,
+        is_coalesced,
+    )
+}
+
+/// Full recompile pipeline: analysis.json -> C++ project on disk.
+pub fn run_recompile(
+    analysis_path: &Path,
+    output_dir: &Path,
+    opts: &RecompileOptions,
+) -> anyhow::Result<()> {
+    let prep = prepare_emission(analysis_path, opts.config_path.as_deref())?;
+    let effective_batch_size = prep.config.functions_per_file.unwrap_or(opts.batch_size);
+
+    // Prepare output directories
+    let gen_dir = output_dir.join("generated");
+    let inc_dir = output_dir.join("include");
+    std::fs::create_dir_all(&gen_dir)?;
+    std::fs::create_dir_all(&inc_dir)?;
+
+    // Emit mid-entry wrappers
+    let parent_name_map = build_parent_name_map(&prep.analysis.functions);
+    let (mid_entries_cpp, mid_entry_fwd_decls) =
+        emit_mid_entry_wrappers(&prep.analysis.mid_entries, &parent_name_map);
+    tracing::info!("Emitting {} mid-entry wrappers", prep.analysis.mid_entries.len());
+
     // Progress bar for function decode+emit
-    let pb = make_progress_bar(analysis.functions.len() as u64);
+    let pb = make_progress_bar(prep.analysis.functions.len() as u64);
 
     // Silent-path collectors (issue #37): the rayon closure records every
     // decode error and statically-emitted RECOMP_LOOKUP target for the report.
@@ -209,21 +259,12 @@ pub fn run_recompile(
 
     // Batch emit (parallel via rayon inside emit_function_batches)
     let batch_output = emit_function_batches(
-        &analysis.functions,
+        &prep.analysis.functions,
         effective_batch_size,
         &mid_entry_fwd_decls,
         |func| {
             pb.inc(1);
-            let func_addr = parse_hex_u32(&func.address).unwrap_or(0);
-            let unique_name = unique_names.get(&func_addr).cloned().unwrap_or_else(|| func.name.clone());
-            // PSPRECOMP_NO_RA_MODEL=1 keeps the structural merge but disables the
-            // Option-A LINK/RA lowering (diagnostic isolating the two halves).
-            let ra_off = std::env::var("PSPRECOMP_NO_RA_MODEL").as_deref() == Ok("1");
-            let is_coalesced = !ra_off && coalesced_owners.contains(&func_addr);
-            let (cpp, diag) = decode_and_emit_function_with_name(
-                func, &unique_name, &segment_bytes, &import_map, &func_map, &config, &data_xrefs,
-                &mid_entry_addr_map, is_coalesced,
-            );
+            let (cpp, diag) = emit_one_function(&prep, func);
             if let Some(error) = diag.decode_error {
                 decode_errors.lock().unwrap().push(DecodeErrorEntry {
                     address: func.address.clone(),
@@ -236,27 +277,30 @@ pub fn run_recompile(
             }
             cpp
         },
-        &unique_names,
+        &prep.unique_names,
     )?;
     pb.finish_with_message("Done decoding functions");
 
     // Write all output files
-    let module_name = &analysis.module_name;
-    write_output_files(output_dir, &analysis, &batch_output, &mid_entries_cpp, module_name, &unique_names)?;
+    let module_name = &prep.analysis.module_name;
+    write_output_files(
+        output_dir, &prep.analysis, &batch_output, &mid_entries_cpp, module_name,
+        &prep.unique_names,
+    )?;
 
     // Constructors are emitted as RECOMP_LOOKUP calls too (init_array.cpp) —
     // include them in the static dispatch-target audit.
     let mut static_lookup_targets = lookup_targets.into_inner().unwrap();
-    static_lookup_targets.extend(analysis.constructors.iter().filter_map(|c| parse_hex_u32(c)));
+    static_lookup_targets.extend(prep.analysis.constructors.iter().filter_map(|c| parse_hex_u32(c)));
 
     // Build + write recompile_report.json (issue #37).
     let recompile_report = report::build_report(report::ReportInputs {
-        analysis: &analysis,
-        discovery,
+        analysis: &prep.analysis,
+        discovery: prep.discovery,
         batch_file_count: batch_output.cpp_files.len(),
         decode_errors: decode_errors.into_inner().unwrap(),
         static_lookup_targets,
-        unique_names: &unique_names,
+        unique_names: &prep.unique_names,
     });
     let report_path = output_dir.join("recompile_report.json");
     std::fs::write(&report_path, serde_json::to_string_pretty(&recompile_report)?)
@@ -264,8 +308,8 @@ pub fn run_recompile(
 
     tracing::info!(
         "Recompile complete: {} functions, {} mid-entries, {} .cpp files -> {}",
-        analysis.functions.len(),
-        analysis.mid_entries.len(),
+        prep.analysis.functions.len(),
+        prep.analysis.mid_entries.len(),
         batch_output.cpp_files.len(),
         output_dir.display(),
     );
@@ -273,8 +317,10 @@ pub fn run_recompile(
 
     // Self-checked counts (issue #37): turn the documented baseline into an
     // assertion when the caller passes --expect-functions/--expect-mid-entries.
-    report::check_expectation("functions", analysis.functions.len(), opts.expect_functions)?;
-    report::check_expectation("mid-entries", analysis.mid_entries.len(), opts.expect_mid_entries)?;
+    report::check_expectation("functions", prep.analysis.functions.len(), opts.expect_functions)?;
+    report::check_expectation(
+        "mid-entries", prep.analysis.mid_entries.len(), opts.expect_mid_entries,
+    )?;
     Ok(())
 }
 
@@ -1292,7 +1338,7 @@ fn is_inside_function(addr: u32, intervals: &[(u32, u32)]) -> bool {
 }
 
 /// Parse a hex string (with or without "0x" prefix) into u32.
-fn parse_hex_u32(s: &str) -> Option<u32> {
+pub(crate) fn parse_hex_u32(s: &str) -> Option<u32> {
     let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
     u64::from_str_radix(trimmed, 16).ok().map(|v| v as u32)
 }

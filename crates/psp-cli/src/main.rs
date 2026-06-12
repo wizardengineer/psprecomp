@@ -1,5 +1,6 @@
 mod analyze;
 mod config;
+mod dump;
 mod hle_entry_scanner;
 mod recompile;
 mod report;
@@ -49,13 +50,22 @@ enum Commands {
         #[arg(long)]
         expect_mid_entries: Option<usize>,
     },
-    /// Dump selected fields from analysis.json to stdout
+    /// Dump analysis.json fields, or one function's generated C++ (0xADDR)
     Dump {
         /// Path to analysis.json
         analysis: std::path::PathBuf,
+        /// A hex function address (e.g. 0x0881E7A8 — emits that function's
+        /// C++ exactly as it appears in its batch file; PSPRECOMP_CROSS_MID
+        /// applies as in recompile), or a list mode:
+        /// functions | imports | relocations | segments | mid_entries
+        target: Option<String>,
         /// What to dump: functions | imports | relocations | segments | mid_entries
-        #[arg(long, default_value = "functions")]
-        what: String,
+        #[arg(long, conflicts_with = "target")]
+        what: Option<String>,
+        /// Optional TOML game config (stubs, skips, patches) — pass the same
+        /// config used for recompile so the dumped C++ matches the batch output
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
     },
 }
 
@@ -88,8 +98,28 @@ fn main() -> anyhow::Result<()> {
             };
             crate::recompile::run_recompile(&analysis, &output, &opts)?;
         }
-        Commands::Dump { analysis, what } => {
-            crate::recompile::run_dump(&analysis, &what)?;
+        Commands::Dump { analysis, target, what, config } => {
+            // stderr writer: the single-function mode prints ONLY the C++ on
+            // stdout so it pipes cleanly; all tracing diagnostics go to stderr.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive(tracing::Level::INFO.into()),
+                )
+                .init();
+            const LIST_MODES: &[&str] =
+                &["functions", "imports", "relocations", "segments", "mid_entries"];
+            match (target.as_deref(), what.as_deref()) {
+                (None, Some(w)) => crate::recompile::run_dump(&analysis, w)?,
+                (None, None) => crate::recompile::run_dump(&analysis, "functions")?,
+                (Some(t), _) if LIST_MODES.contains(&t) => {
+                    crate::recompile::run_dump(&analysis, t)?;
+                }
+                (Some(t), _) => {
+                    crate::dump::run_dump_function(&analysis, t, config.as_deref())?;
+                }
+            }
         }
     }
     Ok(())
