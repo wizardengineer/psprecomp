@@ -14,6 +14,60 @@ find_package(OpenGL REQUIRED)
 # Find zlib (system zlib on macOS; pkg-config-discoverable on Linux)
 find_package(ZLIB REQUIRED)
 
+# ── Build fingerprint staleness check (issue #36) ───────────────────────────
+# output/ is gitignored; building against a stale output/ after an emitter
+# change silently invalidates all conclusions. At configure time, recompute
+# the emitter-source content hash and compare with output/fingerprint.json
+# (written by `psprecomp recompile`). Recipe: crates/psp-cli/src/fingerprint.rs
+# and runtime/cmake/check_fingerprint.py (kept in sync; recipe version 1).
+option(PSPRECOMP_ALLOW_STALE
+    "Allow configuring against a stale output/ (fingerprint mismatch becomes a warning)" OFF)
+
+set(PSPRECOMP_REGEN_CMD
+    "PSPRECOMP_CROSS_MID=1 cargo run --release -- recompile analysis.json -o output")
+
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_fingerprint.py
+            --fingerprint ${CMAKE_CURRENT_SOURCE_DIR}/../output/fingerprint.json
+            --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/..
+        RESULT_VARIABLE PSPRECOMP_FP_RESULT
+        OUTPUT_VARIABLE PSPRECOMP_FP_OUTPUT
+        ERROR_VARIABLE PSPRECOMP_FP_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(PSPRECOMP_FP_RESULT EQUAL 0)
+        message(STATUS "${PSPRECOMP_FP_OUTPUT}")
+    elseif(PSPRECOMP_FP_RESULT EQUAL 2)
+        if(PSPRECOMP_ALLOW_STALE)
+            message(WARNING
+                "BUILDING AGAINST STALE output/ (PSPRECOMP_ALLOW_STALE=ON):\n"
+                "${PSPRECOMP_FP_OUTPUT}\n"
+                "Runtime behavior will NOT reflect the current emitter sources.")
+        else()
+            message(FATAL_ERROR
+                "output/ is stale relative to the emitter sources — run:\n"
+                "    ${PSPRECOMP_REGEN_CMD}\n"
+                "${PSPRECOMP_FP_OUTPUT}\n"
+                "(override with -DPSPRECOMP_ALLOW_STALE=ON at your own risk)")
+        endif()
+    elseif(PSPRECOMP_FP_RESULT EQUAL 3)
+        message(WARNING
+            "output/fingerprint.json not found (output/ predates issue #36). "
+            "Staleness cannot be checked — regenerate to enable it:\n"
+            "    ${PSPRECOMP_REGEN_CMD}")
+    else()
+        message(WARNING
+            "Fingerprint check could not verify output/ freshness "
+            "(exit ${PSPRECOMP_FP_RESULT}):\n"
+            "${PSPRECOMP_FP_OUTPUT}${PSPRECOMP_FP_ERROR}")
+    endif()
+else()
+    message(WARNING
+        "Python3 not found — skipping the output/ staleness check (issue #36).")
+endif()
+
 # Build the recompiler output as a subdirectory
 # output/ contains its own CMakeLists.txt producing libboot_recomp.a
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../output ${CMAKE_CURRENT_BINARY_DIR}/recomp_build)

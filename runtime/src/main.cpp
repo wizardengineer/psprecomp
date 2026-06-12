@@ -16,6 +16,13 @@
 #include "psp_debug_socket.h"
 #include "asset_bnd.h"
 
+// Build fingerprint of the output/ this binary was generated from (issue #36).
+// Guarded so pre-fingerprint output dirs still build (warning at configure
+// time, "unavailable" banner at boot).
+#if __has_include("recomp_fingerprint.h")
+#include "recomp_fingerprint.h"
+#endif
+
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -74,6 +81,20 @@ static void dump_bnd_short_total() {
 int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
+
+    // 0. Identify the output/ this binary was built against (issue #36).
+    //    One grep-stable line; the configure-time fingerprint check is the
+    //    enforcement, this is the audit trail in every run log.
+#ifdef RECOMP_FINGERPRINT_HASH
+    std::fprintf(stderr,
+        "[RT] output fingerprint: %s (cross_mid=%d, recompiled %s)\n",
+        RECOMP_FINGERPRINT_HASH,
+        RECOMP_FINGERPRINT_CROSS_MID,
+        RECOMP_FINGERPRINT_TIMESTAMP);
+#else
+    std::fprintf(stderr,
+        "[RT] output fingerprint: unavailable (output/ predates issue #36)\n");
+#endif
 
     // 1. Install SIGTERM/SIGINT signal handlers
     psp_install_signal_handlers();
