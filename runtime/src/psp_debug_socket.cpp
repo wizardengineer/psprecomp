@@ -357,6 +357,7 @@ static void handle_client(int client_fd) {
     std::vector<char> line(MAX_LINE);
     size_t pos = 0;
     bool overflow = false;
+    bool last_was_cr = false;
 
     while (g_debug_running.load(std::memory_order_relaxed)) {
         // Read one byte at a time until '\n' (commands are tiny; the
@@ -372,9 +373,14 @@ static void handle_client(int client_fd) {
             } else {
                 overflow = true;
             }
+            last_was_cr = false;
             continue;
         }
-        if (pos == 0 && !overflow) continue;
+        // Swallow only the LF of a CRLF pair; a genuine empty line falls
+        // through to the handler and gets "ERR empty" (never silence).
+        const bool crlf_lf = (ch == '\n' && last_was_cr);
+        last_was_cr = (ch == '\r');
+        if (pos == 0 && !overflow && crlf_lf) continue;
         line[pos] = '\0';
         pos = 0;
 
