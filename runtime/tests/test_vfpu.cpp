@@ -148,6 +148,69 @@ static void test_eat_prefixes() {
 }
 
 // ===================================================================
+// Test 3b: vfpu_init_context — a memset(0) context must come out with the
+// hardware-reset identity S/T prefixes (0xE4), NOT 0. A zero prefix is the
+// explicit "all lanes <- component 0" swizzle; if a freshly-created thread
+// kept it, the first VFPU arithmetic op (before any eat_prefixes) silently
+// collapses all operand lanes onto component 0. This is the exact root cause
+// of issue #27 (Patapon's sceGumLookAt vsub.q zeroing the forward vector ->
+// all-zero VIEW matrix). Regression guard for the thread/boot ctx init.
+// ===================================================================
+static void test_init_context_default_prefix() {
+    std::printf("  test_init_context_default_prefix...\n");
+    recomp_context ctx;
+    std::memset(&ctx, 0, sizeof(ctx));  // mimic the thread/boot memset(0)
+    vfpu_init_context(&ctx);
+
+    ASSERT_INT_EQ(ctx.vfpu_ctrl[VFPU_CTRL_SPREFIX], 0xE4u,
+                  "init SPREFIX is identity");
+    ASSERT_INT_EQ(ctx.vfpu_ctrl[VFPU_CTRL_TPREFIX], 0xE4u,
+                  "init TPREFIX is identity");
+
+    // The decisive behavioural check: vsub.q on a freshly-init'd context
+    // (no explicit set_prefix) must subtract component-wise, not swizzle
+    // every lane to component 0. Inputs mirror Patapon's LookAt forward
+    // vector: eye-target where only z differs.
+    // vs=0x00 -> mtx0,col0 -> vfpu[0..3]; vt=0x01 -> mtx0,col1 -> vfpu[4..7]
+    // (mirrors Patapon's LookAt: vsub.q v26, v00, v01).
+    ctx.vfpu[0] = 0.0f;    // eye = (0, 0, 300, 1)
+    ctx.vfpu[1] = 0.0f;
+    ctx.vfpu[2] = 300.0f;
+    ctx.vfpu[3] = 1.0f;
+    ctx.vfpu[4] = 0.0f;    // tgt = (0, 0,   0, 1)
+    ctx.vfpu[5] = 0.0f;
+    ctx.vfpu[6] = 0.0f;
+    ctx.vfpu[7] = 1.0f;
+
+    // vsub.q vd=0x08, vs=0x00, vt=0x01, size=4
+    // vd=0x08 -> mtx=2, col=0 -> result lands in vfpu[32..35].
+    vfpu_vsub(&ctx, nullptr, 0x08, 0x00, 0x01, 4);
+
+    ASSERT_EXACT(ctx.vfpu[32], 0.0f, "default-prefix vsub[0]");
+    ASSERT_EXACT(ctx.vfpu[33], 0.0f, "default-prefix vsub[1]");
+    // The decisive component: with the prefix-init bug this read 0 (every
+    // lane swizzled to component 0 == 0); correct subtraction yields 300.
+    ASSERT_EXACT(ctx.vfpu[34], 300.0f,
+                 "default-prefix vsub[2] (would be 0 with prefix bug)");
+    ASSERT_EXACT(ctx.vfpu[35], 0.0f, "default-prefix vsub[3]");
+}
+
+// Probe: does vfpu_write_vector land a quad in a TRANSPOSED dest (bit5=1)?
+static void test_transpose_write_quad() {
+    std::printf("  test_transpose_write_quad...\n");
+    recomp_context ctx;
+    init_ctx(ctx);
+    float d[4] = {0.0f, 0.0f, 300.0f, 0.0f};
+    // reg 0x26 -> transpose=1, mtx=1, col(=row anchor)=2, col-start=0.
+    // Expected cells (row-form): vfpu[18,22,26,30].
+    vfpu_write_vector(d, 4, 0x26, ctx.vfpu, 0);
+    ASSERT_EXACT(ctx.vfpu[18], 0.0f,   "tw[0] -> vfpu[18]");
+    ASSERT_EXACT(ctx.vfpu[22], 0.0f,   "tw[1] -> vfpu[22]");
+    ASSERT_EXACT(ctx.vfpu[26], 300.0f, "tw[2] -> vfpu[26]");
+    ASSERT_EXACT(ctx.vfpu[30], 0.0f,   "tw[3] -> vfpu[30]");
+}
+
+// ===================================================================
 // Test 4: Prefix swizzle on a pair vector
 // ===================================================================
 static void test_prefix_swizzle() {
@@ -502,6 +565,98 @@ static void test_sce_gum_ortho() {
 }
 
 // ===================================================================
+// Test: vcmov safe-normalize guard (issue #27 view-matrix fix)
+//
+// sceGumLookAt normalizes the forward/right/up vectors with a degenerate
+// guard:  vcmp(EZ, len2)  ->  vrsq(scale)  ->  vcmov(scale<-0 IF len2==0).
+// The vcmov must be a CONDITIONAL move: for a non-degenerate vector the
+// CC bit is clear and the rsqrt scale is preserved. The decoder used to
+// mis-decode this word (0xD2A06808) as vf2iz, which unconditionally
+// re-zeroed the scale and collapsed the whole view matrix to zero.
+// ===================================================================
+static void test_vcmov_safe_normalize() {
+    std::printf("  test_vcmov_safe_normalize...\n");
+    recomp_context ctx;
+
+    const int v08 = vfpu_single_index(0x08);  // rsqrt scale slot
+    const int v68 = vfpu_single_index(0x68);  // zeroed scratch slot
+
+    // --- Non-degenerate (the real LookAt case): CC bit 0 clear. ---
+    init_ctx(ctx);
+    const float scale = 1.0f / 300.0f;
+    ctx.vfpu[v08] = scale;
+    ctx.vfpu[v68] = 0.0f;
+    ctx.vfpu_ctrl[VFPU_CTRL_CC] = 0;  // vcmp(EZ) found len2 != 0
+    // vcmov v08, v68, cc_field=0 (imm3=0, tf=0): move iff CC[0]==1.
+    vfpu_vcmov(&ctx, nullptr, 0x08, 0x68, 0, 1);
+    ASSERT_EXACT(ctx.vfpu[v08], scale,
+                 "vcmov preserves rsqrt scale when len2 != 0");
+
+    // --- Degenerate (len2 == 0): CC bit 0 set, scale -> 0. ---
+    init_ctx(ctx);
+    ctx.vfpu[v08] = scale;
+    ctx.vfpu[v68] = 0.0f;
+    ctx.vfpu_ctrl[VFPU_CTRL_CC] = 0x1;  // vcmp(EZ) found len2 == 0
+    vfpu_vcmov(&ctx, nullptr, 0x08, 0x68, 0, 1);
+    ASSERT_EXACT(ctx.vfpu[v08], 0.0f,
+                 "vcmov zeroes scale when len2 == 0 (CC[0] set)");
+
+    // --- tf=1 inverts the sense: move iff CC[0]==0. ---
+    init_ctx(ctx);
+    ctx.vfpu[v08] = scale;
+    ctx.vfpu[v68] = 0.0f;
+    ctx.vfpu_ctrl[VFPU_CTRL_CC] = 0;  // CC[0] clear
+    // cc_field = imm3(0) | tf(1)<<3 = 0x08
+    vfpu_vcmov(&ctx, nullptr, 0x08, 0x68, 0x08, 1);
+    ASSERT_EXACT(ctx.vfpu[v08], 0.0f,
+                 "vcmov tf=1 moves when CC[0] clear");
+}
+
+// ===================================================================
+// Test: full LookAt forward-vector normalize stays finite (#27)
+//
+// Mirrors the exact runtime op sequence around 0x08857E80..0x08857E9C:
+//   vsub forward = eye - tgt = (0,0,300)
+//   vdot len2 = dot(fwd,fwd) = 90000
+//   vcmp EZ len2 ; vrsq scale=1/sqrt(len2) ; vcmov(guard) ; vscl fwd*=scale
+// The forward vector must come out unit-length, NOT zero.
+// ===================================================================
+static void test_lookat_forward_normalize() {
+    std::printf("  test_lookat_forward_normalize...\n");
+    recomp_context ctx;
+    init_ctx(ctx);
+
+    // v00 = eye (0,0,300), v01 = tgt (0,0,0), as quads.
+    const int v00 = vfpu_single_index(0x00);
+    ctx.vfpu[v00 + 0] = 0.0f;
+    ctx.vfpu[v00 + 1] = 0.0f;
+    ctx.vfpu[v00 + 2] = 300.0f;
+    ctx.vfpu[v00 + 3] = 1.0f;
+    // v01 column already zeroed by init_ctx.
+
+    vfpu_vsub(&ctx, nullptr, 0x26, 0x00, 0x01, 4);   // fwd = eye - tgt
+    vfpu_vdot(&ctx, nullptr, 0x08, 0x26, 0x26, 3);   // len2 = 90000
+    vfpu_vzero(&ctx, nullptr, 0x68, 1);              // scratch = 0
+    vfpu_vcmp(&ctx, nullptr, 0x08, 0x08, 8, 1);      // CC[0] = (len2==0)
+    vfpu_vrsq(&ctx, nullptr, 0x08, 0x08, 1);         // scale = 1/sqrt(len2)
+    vfpu_vcmov(&ctx, nullptr, 0x08, 0x68, 0, 1);     // guard (no-op here)
+    vfpu_set_prefix(&ctx, 2, 0x0000083Fu);
+    vfpu_vscl(&ctx, nullptr, 0x26, 0x26, 0x08, 3);   // fwd *= scale
+
+    const int v26 = vfpu_single_index(0x26);
+    // The third column slot for reg 0x26 (mtx1,col2): read normalized z.
+    float fwd[4];
+    vfpu_read_vector(fwd, 3, 0x26, ctx.vfpu);
+    const float len = std::sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1]
+                                 + fwd[2]*fwd[2]);
+    (void)v26;
+    ASSERT_APPROX(len, 1.0f, 1e-5f,
+                  "LookAt forward vector normalized to unit length");
+    ASSERT_APPROX(fwd[2], 1.0f, 1e-5f,
+                  "LookAt forward z stays finite (was 0 pre-fix)");
+}
+
+// ===================================================================
 // main
 // ===================================================================
 
@@ -511,6 +666,8 @@ int main() {
     test_sin_cardinals();
     test_cos_cardinals();
     test_eat_prefixes();
+    test_init_context_default_prefix();
+    test_transpose_write_quad();
     test_prefix_swizzle();
     test_vmmul_identity();
     test_trig_noncardinal();
@@ -520,6 +677,8 @@ int main() {
     test_lvq_quad_disjoint();
     test_transpose_roundtrip();
     test_sce_gum_ortho();
+    test_vcmov_safe_normalize();
+    test_lookat_forward_normalize();
 
     std::printf("\n%d tests run, %d failures\n",
                 tests_run, failures);

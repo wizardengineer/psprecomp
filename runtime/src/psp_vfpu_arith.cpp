@@ -375,31 +375,35 @@ void vfpu_vcmp(recomp_context* ctx, uint8_t*,
 void vfpu_vcmov(recomp_context* ctx, uint8_t*,
                 uint8_t vd, uint8_t vs, uint8_t cc_field,
                 uint8_t size) {
+    // cc_field packs the PSP vcmov operands as decoded by the Rust
+    // decoder: imm3 = bits[2:0] (CC bit selector), tf = bit[3]
+    // (the true/false sense bit, op[19]). Matches PPSSPP Int_Vcmov:
+    // the conditional move fires when ((CC >> imm3) & 1) == !tf.
+    const int imm3 = cc_field & 7;
+    const bool tf = (cc_field >> 3) & 1;
+
     float s[4], d[4];
     vfpu_read_vector(s, size, vs, ctx->vfpu);
-    vfpu_read_vector(d, size, vd, ctx->vfpu);
     vfpu_apply_prefix_st(s, ctx->vfpu_ctrl[VFPU_CTRL_SPREFIX],
+                         size);
+    // D is read as the T operand and the T prefix applies to it.
+    vfpu_read_vector(d, size, vd, ctx->vfpu);
+    vfpu_apply_prefix_st(d, ctx->vfpu_ctrl[VFPU_CTRL_TPREFIX],
                          size);
 
     uint32_t cc = ctx->vfpu_ctrl[VFPU_CTRL_CC];
 
-    if (cc_field < 6) {
-        // Move if CC[cc_field] is set
-        bool cond = (cc >> cc_field) & 1;
-        if (cond) {
+    if (imm3 < 6) {
+        if ((int)((cc >> imm3) & 1) == (int)(!tf)) {
             for (int i = 0; i < size; i++) d[i] = s[i];
         }
-    } else {
-        // cc_field >= 6: per-element conditional move
-        // cc_field == 6: move if CC[i] is set
-        // cc_field == 7: move if CC[i] is NOT set
-        bool invert = (cc_field == 7);
+    } else if (imm3 == 6) {
+        // Per-element: move lane i when CC[i] matches the tf sense.
         for (int i = 0; i < size; i++) {
-            bool bit = (cc >> i) & 1;
-            if (invert) bit = !bit;
-            if (bit) d[i] = s[i];
+            if ((int)((cc >> i) & 1) == (int)(!tf)) d[i] = s[i];
         }
     }
+    // imm3 == 7 is invalid on hardware (PPSSPP logs and no-ops).
 
     vfpu_apply_prefix_d(d, ctx->vfpu_ctrl[VFPU_CTRL_DPREFIX],
                         size);

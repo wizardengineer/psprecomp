@@ -167,6 +167,14 @@ void vfpu_eat_prefixes(recomp_context* ctx) {
     ctx->vfpu_ctrl[VFPU_CTRL_DPREFIX] = 0x00u;
 }
 
+void vfpu_init_context(recomp_context* ctx) {
+    // A freshly memset(0) context leaves S/T prefix == 0, which is the
+    // explicit "all lanes <- component 0" swizzle -- NOT the hardware-reset
+    // identity (0xE4). The "no prefix pending" state is exactly what
+    // vfpu_eat_prefixes installs, so reuse it for the reset default.
+    vfpu_eat_prefixes(ctx);
+}
+
 void vfpu_set_prefix(recomp_context* ctx, int reg_idx,
                      uint32_t data) {
     ctx->vfpu_ctrl[VFPU_CTRL_SPREFIX + reg_idx] = data;
