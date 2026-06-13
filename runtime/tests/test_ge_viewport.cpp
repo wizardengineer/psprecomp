@@ -116,6 +116,26 @@ static void test_depth_clamped_subrange() {
     ASSERT_NEAR(v.far_z, 24576.0f / 65535.0f, "far == 24576/65535");
 }
 
+// Reversed-Z (issue #23 Fix-2 precondition). A negative ZSCALE (Patapon)
+// makes near = (center - scale)/65535 LARGER than far = (center + scale)/65535,
+// i.e. glDepthRange(near>far). The draw path keys its glClearDepth(far) and
+// reversed depth-func mapping off exactly this near>far ordering, so assert it
+// holds for a representative Patapon-style ZSCALE<0 / full ZCENTER.
+static void test_reversed_z_range() {
+    GeViewportDepth v = ge_compute_viewport_depth(
+        240.0f, -136.0f, 2048.0f, 2048.0f,
+        -32767.5f, 32767.5f, 0u, 0u, FBH);
+    ASSERT_NEAR(v.near_z, 1.0f, "reversed near == 1.0 (center-scale)");
+    ASSERT_NEAR(v.far_z, 0.0f, "reversed far == 0.0 (center+scale)");
+    tests_run++;
+    if (!(v.near_z > v.far_z)) {
+        std::fprintf(stderr,
+            "FAIL: reversed-Z must yield near>far (got near=%g far=%g)\n",
+            v.near_z, v.far_z);
+        failures++;
+    }
+}
+
 int main() {
     test_fullscreen_default_matches_hardcoded();
     test_fullscreen_depth_range();
@@ -123,6 +143,7 @@ int main() {
     test_y_flip_bottom_half();
     test_offset_subpixel_and_mask();
     test_depth_clamped_subrange();
+    test_reversed_z_range();
 
     if (failures == 0) {
         std::printf("test_ge_viewport: %d/%d PASS\n", tests_run, tests_run);
