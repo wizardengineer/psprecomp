@@ -223,10 +223,24 @@ void sched_yield_point() {
 // <= 0. DEFAULT-OFF: with PSPRECOMP_PREEMPT unset/"0" this is a no-op beyond
 // reloading the budget — the back-edge decrement becomes a dead effect and
 // guest behavior is byte-identical to the pre-#66 scheduler (the gate this unit
-// must pass on Patapon). When PSPRECOMP_PREEMPT=1 it additionally takes a fair
-// cooperative yield so a syscall-free busy-poll reaches a reschedule point;
-// step 3 (#66) replaces this with the real preemptive yield and validates it
-// against the .hack freeze-rate harness. The flag is read once and cached.
+// must pass on Patapon).
+//
+// FLAG-ON (PSPRECOMP_PREEMPT=1) — the real preemptive yield (#66 step 3).
+//
+// ⚠ FALSIFIED — DO NOT ENABLE THIS FLAG. The decision experiment
+// (.planning/research/sched-step3-result.md) showed this real preemptive yield
+// does NOT reduce the .hack//Link CRI-ring freeze rate (OFF 17/30=56.7% vs
+// ON 17/29=58.6%, N≈30 — statistically identical). The cooperative-starvation
+// premise of SCHEDULER-DESIGN.md §2/§5 is wrong for this title: at the freeze,
+// the producer threads (`CRI ADX File`/`CRI ADX Audio`/`CriThread`×3) are all
+// RUNNING on their own real std::threads, NOT starved and NOT parked, so
+// descheduling the busy-poll consumer gives the producer no CPU it was being
+// denied, and a seq_cst fence pair does not rescue the (non-stale) read. The
+// real cause is a single-CPU-ordering / convergence problem in the cross-thread
+// ring hand-off that approach (a) cannot supply; the next leg is approach (d)
+// (single-runnable token + quantum). This code is kept default-off (no behavior
+// change to Patapon or the default .hack build) only as the documented,
+// experimentally-falsified attempt. The flag is read once and cached.
 // ---------------------------------------------------------------------------
 static bool sched_preempt_enabled() {
     static const bool enabled = [] {
@@ -245,9 +259,25 @@ void sched_preempt(recomp_context* ctx) {
     if (!sched_preempt_enabled()) {
         return;  // DEFAULT-OFF: dead-effect counter, no yield.
     }
-    // Flag ON (not enabled by default in this unit): take a fair cooperative
-    // yield. Step 3 swaps this for the real preemptive yield + memory fence.
+    if (g_should_exit.load(std::memory_order_acquire)) {
+        return;  // shutting down — do not park or sleep.
+    }
+
+    // Cooperative fairness leg (unchanged): hand off to a higher-priority READY
+    // peer if one exists. No-op for the busy-poll race (producer is RUNNING,
+    // not READY) but preserves the existing yield-point contract.
     sched_yield_point();
+
+    // Preemptive leg (FALSIFIED — see header note): publish this thread's
+    // writes, relinquish the core so a concurrently-RUNNING producer advances
+    // the shared ring, then re-acquire so the resumed busy-poll observes that
+    // progress. The fence pair supplies the happens-before the bare-rdram ring
+    // pointers are read/written without. Measured to NOT change the .hack
+    // freeze rate; retained behind the default-off flag as the documented
+    // attempt only.
+    std::atomic_thread_fence(std::memory_order_release);
+    std::this_thread::sleep_for(SCHED_PREEMPT_QUANTUM);
+    std::atomic_thread_fence(std::memory_order_acquire);
 }
 
 // ---------------------------------------------------------------------------

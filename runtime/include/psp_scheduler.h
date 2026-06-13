@@ -56,6 +56,17 @@ static constexpr int SCHED_TIMEOUT_MS = 50;
 /// runs before reaching a preemption point once the flag is enabled.
 static constexpr int32_t SCHED_PREEMPT_BUDGET = 100000;
 
+/// Sub-quantum deschedule duration for the FLAG-ON preemptive yield
+/// (`PSPRECOMP_PREEMPT=1`, #66 step 3). ⚠ FALSIFIED — the flag does not reduce
+/// the .hack freeze rate (.planning/research/sched-step3-result.md); kept only
+/// for the documented attempt and never reached by default-off builds. 100us is
+/// under the PSP scheduler quantum (~200us): long enough that a
+/// concurrently-RUNNING producer is actually scheduled (a bare
+/// std::this_thread::yield() is only a hint the host may ignore on an idle
+/// core), short enough to bound worst-case forward-progress latency. Generic and
+/// title-agnostic (purity gate).
+static constexpr std::chrono::microseconds SCHED_PREEMPT_QUANTUM{100};
+
 /// Per-thread state for PSP cooperative scheduler.
 /// Each thread gets its own recomp_context (RUNTIME-01) so register state
 /// is naturally isolated without save/restore.
@@ -103,11 +114,14 @@ void sched_yield_point();
 /// emitted code at loop back-edges when `ctx->preempt_budget` hits <= 0.
 /// DEFAULT-OFF: with the `PSPRECOMP_PREEMPT` env var unset or "0" this only
 /// reloads `ctx->preempt_budget` to SCHED_PREEMPT_BUDGET and returns (no yield),
-/// so the decrement is a dead effect and Patapon behavior is unchanged. When
-/// `PSPRECOMP_PREEMPT=1` it reloads the budget and additionally takes a fair
-/// cooperative yield (step 3 wires the real preemptive yield; today the enabled
-/// path reuses `sched_yield_point()`). Always resets the budget so the spin loop
-/// does not call back every iteration.
+/// so the decrement is a dead effect and Patapon behavior is unchanged.
+/// ⚠ FLAG-ON IS FALSIFIED — DO NOT ENABLE: with `PSPRECOMP_PREEMPT=1` it takes
+/// a real preemptive yield (cooperative handoff + sub-quantum deschedule +
+/// seq_cst fence pair), but the #66 step-3 experiment measured NO drop in the
+/// .hack freeze rate (.planning/research/sched-step3-result.md). Retained behind
+/// the default-off flag only as the documented attempt; the real fix is approach
+/// (d). Always resets the budget so the spin loop does not call back every
+/// iteration.
 void sched_preempt(recomp_context* ctx);
 
 /// Mark current thread DEAD, decrement g_alive_threads, wake next thread.
