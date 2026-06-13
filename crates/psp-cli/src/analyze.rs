@@ -422,6 +422,15 @@ pub fn run_analyze(
     // image, so every pointer field is final. D8 (PRX): hard error — never a
     // silent empty imports[]; ET_EXEC degrades loudly only when SceModuleInfo
     // itself is absent (recompile refuses an import-free analysis.json).
+    if !nid_db.exists() {
+        anyhow::bail!(
+            "NID database not found at {}.\n\
+             It is not committed (it is PPSSPP-derived; data/ is gitignored).\n\
+             Fetch it with: ./scripts/fetch-niddb.sh\n\
+             Or pass an existing copy with --nid-db <path>.",
+            nid_db.display()
+        );
+    }
     let nid_map = nid::load_nid_database(nid_db)
         .with_context(|| format!("Cannot load NID DB from {}", nid_db.display()))?;
     let (import_stubs, module_info) = if is_prx {

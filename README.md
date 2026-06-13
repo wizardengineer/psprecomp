@@ -133,12 +133,27 @@ distributed with this repository):
 - `BOOT.BIN` — the game executable, from `PSP_GAME/SYSDIR/` on the disc.
 - `disc0/` — the extracted ISO contents (assets the game loads at runtime).
 
+The `analyze` step also needs the PSP NID database (`data/niddb/ppsspp_niddb.xml`), which
+maps firmware function NIDs to names. It is not committed (PPSSPP-derived; `data/` is
+gitignored). Fetch it once after cloning:
+
+```bash
+./scripts/fetch-niddb.sh
+```
+
+It downloads from [pspdev/psp-ghidra-scripts](https://github.com/pspdev/psp-ghidra-scripts)
+(NID names derived from PPSSPP, GPL-2.0-or-later), verifies the checksum, and is idempotent.
+If `analyze` is run without it, it stops with a message pointing at this script.
+
 ### Full pipeline
 
 ```bash
 # 1. Rust pipeline
 cargo build --release
 cargo test
+
+# 1b. NID database (once per clone; needed by analyze)
+./scripts/fetch-niddb.sh
 
 # 2. Analyze the binary -> analysis.json (requires Ghidra + ghidra-allegrex; once per binary)
 cargo run --release -- analyze --ghidra-dir "$(brew --prefix ghidra)/libexec" BOOT.BIN
