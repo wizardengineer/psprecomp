@@ -52,6 +52,15 @@ void vfpu_eat_prefixes(recomp_context* ctx);
 void vfpu_set_prefix(recomp_context* ctx, int reg_idx,
                      uint32_t data);
 
+/// Initialise a freshly-zeroed context's VFPU control registers to their
+/// hardware-reset/"no prefix pending" state. The S/T prefixes default to the
+/// identity swizzle 0xE4 (lane i <- component i); a zero prefix is NOT the
+/// default -- it is an explicit "all lanes <- component 0" swizzle. Every
+/// recomp_context must be passed through this after a memset(0), or the first
+/// VFPU arithmetic op on the thread (before any eat_prefixes resets the state)
+/// silently swizzles all operand lanes to component 0 and corrupts the result.
+void vfpu_init_context(recomp_context* ctx);
+
 // ---------------------------------------------------------------------------
 // Control register moves
 // ---------------------------------------------------------------------------

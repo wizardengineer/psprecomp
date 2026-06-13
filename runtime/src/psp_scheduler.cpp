@@ -1,5 +1,6 @@
 #include "psp_scheduler.h"
 #include "psp_debug_socket.h"  // PspDebugThreadInfo ([#35] I command)
+#include "psp_vfpu.h"  // vfpu_init_context — VFPU prefix reset default
 #include "hle/psp_hle.h"  // SCE_KERNEL_ERROR_WAIT_TIMEOUT
 #include <cstdio>
 #include <cstring>
@@ -33,6 +34,7 @@ void psp_scheduler_init() {
         std::memset(g_threads[i].wait_reason, 0,
                     sizeof(g_threads[i].wait_reason));
         std::memset(&g_threads[i].ctx, 0, sizeof(recomp_context));
+        vfpu_init_context(&g_threads[i].ctx);
     }
 }
 
@@ -63,6 +65,7 @@ int psp_thread_create(
                 std::strncpy(t.name, name, sizeof(t.name) - 1);
             }
             std::memset(&t.ctx, 0, sizeof(recomp_context));
+            vfpu_init_context(&t.ctx);
             return i;
         }
     }

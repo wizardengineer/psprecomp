@@ -13,6 +13,7 @@
 #include "hle/psp_hle_io.h"
 #include "psp_debug_socket.h"
 #include "psp_game_module.h"
+#include "psp_vfpu.h"  // vfpu_init_context — VFPU prefix reset default
 
 // Build fingerprint of the output/ this binary was generated from (issue #36).
 // Guarded so pre-fingerprint output dirs still build (warning at configure
@@ -273,6 +274,10 @@ int main(int argc, char* argv[]) {
 
     // 6. Create context for boot-time calls (constructors + module_start)
     recomp_context ctx{};
+    // Zero-init leaves VFPU S/T prefixes at 0 (= "all lanes <- component 0"),
+    // not the hardware-reset identity 0xE4; reset them so the boot thread's
+    // first VFPU arithmetic op isn't silently corrupted (issue #27).
+    vfpu_init_context(&ctx);
     // Boot context k0 area: 256 bytes at the very top of user RAM.
     // k0 register points to this area; usable SP starts below it.
     // k0+04 = heap descriptor (dlmalloc checks this to select heap)
