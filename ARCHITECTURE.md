@@ -40,7 +40,7 @@ All under `crates/`:
 |-------|----------------|
 | `psp-parser` | ELF/PRX parsing (goblin 0.9.3); PRX loading: segment rebase to `PSP_USER_MODULE_BASE`, section-first Type-A relocation discovery + PPSSPP-faithful application (`reloc.rs`), `LoadedImage` virtual-address view (`image.rs`), SceModuleInfo lookup (`prx.rs`), libstub import walking + NID resolution (`imports.rs`, `nid.rs`) |
 | `psp-ir` | `MipsOp` enum, `DecodedFunction` — typed IR for all Allegrex + FPU instructions |
-| `psp-decoder` | MIPS32 + Allegrex + FPU instruction decoding, two-pass delay-slot reordering; a branched-into delay slot (BIDS, #56) is fused at the branch (`BranchHazardDelay`) and duplicated at the slot's own position (`DelaySlotRejoin`) so back-edges into the slot keep hardware semantics |
+| `psp-decoder` | MIPS32 + Allegrex + FPU instruction decoding, two-pass delay-slot reordering; a branched-into delay slot (BIDS, #56) is fused at the branch (`BranchHazardDelay`) and duplicated at the slot's own position (`DelaySlotRejoin`) so back-edges into the slot keep hardware semantics. VFPU4 (opcode 0x34) dispatches on PPSSPP's 5-bit `tableVFPU4Jump` index (`bits[25:21]`, #27) — the prior 3-bit dispatch mis-decoded the whole `vf2i/vi2f/vcmov/vcst/vsrt/vbfy/vfad/vavg/vwbn` family (e.g. `vcmov`→`vf2iz`), which is what kept Patapon off its real transform path |
 | `psp-optimizer` | Peephole passes; all disabled by default (`OptimizerConfig::default()` all false) |
 | `psp-emitter` | C++ code generation, batch emission (rayon), dispatch table, generated CMakeLists; a function body whose end is reachable (last op is not an unconditional control transfer — the function-granularity sibling of BIDS) gets an explicit fall-through tail `RECOMP_LOOKUP(end_vaddr); return;` so execution continues into the next function instead of silently returning; mutually exclusive with the reconstructed terminal-`jal` epilogue, which synthesizes the downstream teardown instead |
 | `psp-cli` | `psprecomp` binary with `analyze`, `recompile`, `dump` subcommands |
@@ -126,6 +126,17 @@ Patapon code; all default to no-op when uninstalled):
 | `psp_io_set_policy` (`PspIoPolicy`) | `hle/psp_hle_io.h` | No archive reroute / slot staging / artifact filter; slice-fd mechanics stay in core |
 | `ge_vertex_set_degenerate_fallback` | `psp_ge_vertex.h` | World-space passthrough + one-time warn |
 
+The degenerate-matrix fallback fires on three triggers, all computed generically in
+core (no game constants): an all-zero view matrix, a non-finite/diagonal-degenerate
+projection, and — added in #23 — a *collapsed composed MVP* (`ge_mvp_collapses` in
+`psp_ge_vertex.cpp`), which transforms the prim's vertices and flags it when a
+meaningfully-spread model footprint crushes to a sub-pixel NDC sliver (absolute *and*
+relative thresholds must both hold, so legitimately-small geometry is never mis-flagged).
+The collapse detector is a **temporary mask** over the still-open guest-matrix dataflow
+bug (#67): the guest-uploaded matrices now arrive non-zero but numerically broken, so the
+older gates miss them while the screen goes black. It keeps Patapon's visible output
+correct until the matrices are root-fixed; its removal criterion is that fix landing.
+
 The quarantine is enforced mechanically by `runtime/tools/purity_gate.sh` (see
 DEBUGGING.md §2): no non-allowlisted `0x08xxxxxx`/`0x09xxxxxx` literal in
 `runtime/src` + `runtime/include`, and no game symbol (defined or undefined) in any
@@ -148,10 +159,10 @@ All under `runtime/` (headers in `runtime/include/`, sources in `runtime/src/`):
 | Scheduler | `psp_scheduler.cpp` | Cooperative threading (`PspThread`, yield points); `thread_local PspThread* g_current` |
 | HLE | `src/hle/psp_hle_*.cpp` | Firmware NID implementations: io, kernel (thread/sema/mutex/lwmutex/eventflag/memory), display, ge, ctrl, power, utility; name-based registration wired to the generated `syscall_table.cpp` stub addresses via dispatch overrides (issue #40 — no per-game stub addresses in the runtime; unbound stubs get a loud per-NID unimplemented no-op that returns a deterministic `v0 = 0`; NID→stub lookup for runtime code via `psp_hle_stub_addr_for_nid`) |
 | GE list processor | `psp_ge.cpp` | Display-list interpretation, including SIGNAL flow-control behaviors 0x10–0x12 (JUMP/CALL/RET) |
-| Renderer | `psp_ge_draw.cpp`, `psp_ge_vertex.cpp`, `psp_ge_texture.cpp`, `psp_ge_shader.cpp` | Vertex decode/transform (column-major PSP matrices), CLUT/texture decode, shaders, GL draw — deep-dive in [docs/GRAPHICS.md](docs/GRAPHICS.md) |
+| Renderer | `psp_ge_draw.cpp`, `psp_ge_vertex.cpp`, `psp_ge_viewport.cpp`, `psp_ge_texture.cpp`, `psp_ge_shader.cpp` | Vertex decode/transform (column-major PSP matrices), CLUT/texture decode, shaders, GL draw; `psp_ge_viewport.cpp` (`ge_compute_viewport_depth`, #23) maps PSP viewport scale/offset → `glViewport` and the reversed-Z depth range → `glDepthRange` (replacing the old hardcoded `glViewport(0,0,480,272)`) — deep-dive in [docs/GRAPHICS.md](docs/GRAPHICS.md) |
 | Render queue | `psp_render_queue.cpp` | Condvar request queue — the only path by which GL work reaches the main thread |
 | Event loop | `psp_event_loop.cpp` | SDL2 event pump, quit handling, render-queue drain |
-| VFPU | `psp_vfpu_*.cpp` | VFPU instruction implementations (arith, convert, matrix, mem, trig, misc) |
+| VFPU | `psp_vfpu_*.cpp` | VFPU instruction implementations (arith, convert, matrix, mem, trig, misc); S/T prefixes initialize to identity (`0xE4`) on context creation (#27 — a `memset(0)` context would otherwise apply a non-identity prefix to the first VFPU op) |
 | Asset/BND | `games/patapon/runtime/asset_bnd.cpp` | Patapon BND archive parsing (`DATA_CMN.BND`) — lives wholly in the Patapon game module (#47 Phase 5), reached from core only through the `PspIoPolicy` seam; arena constants in `games/patapon/runtime/asset_bnd.h` |
 | Debug socket | `psp_debug_socket.cpp` | TCP server on port 9999, multiple concurrent clients, OK/ERR-framed line protocol: memory read/write, runtime-info JSON, button injection, screenshots (serviced by the render thread). Protocol reference: DEBUGGING.md §6 |
 

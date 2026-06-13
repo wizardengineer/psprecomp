@@ -194,14 +194,27 @@ through its debugger API) to capture ground truth and find the first divergence 
 The runtime exposes a TCP debug socket on port 9999 for live memory inspection, and changes are
 checked with adversarial sub-agent verification before they are banked.
 
+The CLEANROOM verification gate also asserts **visible output**, not just display-list activity.
+A prim-count check (`real_nonsprite > 0`) is blind to a black screen — a broken transform can
+submit thousands of prims that all collapse to a sub-pixel dot — so the gate grabs a frame over
+the debug socket and runs `runtime/tools/visible_output_gate.py`, which fails unless the frame
+clears distinct-color and non-black-pixel thresholds. (Methodology: DEBUGGING.md §2.)
+
+Work integrates on the `dev` branch: PRs and parallel workstreams land on `dev`, and `master`
+stays gated until both supported games are regression-clean.
+
 ## Limitations
 
-- **Temporary renderer fallbacks.** A known open guest-side bug remains: recompiled FPU/VFPU code
-  computes broken view/projection matrices (all-zero view, NaN projection). A renderer fallback
-  compensates: degenerate matrices route to a game-installable NDC mapping
+- **Temporary renderer fallback for broken matrices.** A known open guest-side bug remains
+  (issue #67): recompiled FPU/VFPU code still composes numerically broken view/projection
+  matrices. A generic, no-game-constants detector in core flags the failure modes — an all-zero
+  view, a non-finite/degenerate projection, or a *collapsed composed MVP* that crushes a prim to
+  a sub-pixel sliver — and routes those draws to a game-installable NDC mapping
   (`games/patapon/runtime/hooks_ge.cpp` provides Patapon's ortho; generic builds pass world
-  space through with a warning). This is adequate for the 2D title/menu screens but must be
-  fixed before 3D gameplay: the mapping hardcodes Patapon's viewport and has no depth ordering.
+  space through with a warning). This keeps the 2D title/menu screens correct but is a mask, not
+  a fix: it is removed once the matrices are root-fixed, before 3D gameplay can work.
+  (Independent of this, transform-mode draws now apply the real PSP viewport scale/offset and
+  reversed-Z depth range, issue #23 — see [docs/GRAPHICS.md](docs/GRAPHICS.md).)
 - **No audio.** ATRAC and SAS are crude stubs (0 samples decoded, instant end-of-stream).
 - **GE gaps.** SIGNAL relative/offset variants (0x13–0x18), lighting, texture matrix, bone/morph
   skinning, bezier surfaces, and block transfers (TRANSFERSTART) are unimplemented.
