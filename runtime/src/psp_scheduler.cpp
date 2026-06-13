@@ -3,6 +3,7 @@
 #include "psp_vfpu.h"  // vfpu_init_context — VFPU prefix reset default
 #include "hle/psp_hle.h"  // SCE_KERNEL_ERROR_WAIT_TIMEOUT
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 /// Global scheduler lock — held during ALL status transitions and cv ops.
@@ -213,6 +214,40 @@ void sched_yield_point() {
     if (current->status == READY) {
         current->status = RUNNING;
     }
+}
+
+// ---------------------------------------------------------------------------
+// sched_preempt — instruction-budget preemption hook (#66, approach (a))
+//
+// Called from emitted code at loop back-edges once ctx->preempt_budget hits
+// <= 0. DEFAULT-OFF: with PSPRECOMP_PREEMPT unset/"0" this is a no-op beyond
+// reloading the budget — the back-edge decrement becomes a dead effect and
+// guest behavior is byte-identical to the pre-#66 scheduler (the gate this unit
+// must pass on Patapon). When PSPRECOMP_PREEMPT=1 it additionally takes a fair
+// cooperative yield so a syscall-free busy-poll reaches a reschedule point;
+// step 3 (#66) replaces this with the real preemptive yield and validates it
+// against the .hack freeze-rate harness. The flag is read once and cached.
+// ---------------------------------------------------------------------------
+static bool sched_preempt_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PSPRECOMP_PREEMPT");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
+void sched_preempt(recomp_context* ctx) {
+    // Always reload first: a syscall-free spin must not call back every
+    // iteration, and this self-primes the memset-zero initial budget.
+    if (ctx) {
+        ctx->preempt_budget = SCHED_PREEMPT_BUDGET;
+    }
+    if (!sched_preempt_enabled()) {
+        return;  // DEFAULT-OFF: dead-effect counter, no yield.
+    }
+    // Flag ON (not enabled by default in this unit): take a fair cooperative
+    // yield. Step 3 swaps this for the real preemptive yield + memory fence.
+    sched_yield_point();
 }
 
 // ---------------------------------------------------------------------------

@@ -46,6 +46,16 @@ static constexpr int MAX_THREADS = 64;
 /// enters a tight compute loop with no yield calls (RUNTIME-06).
 static constexpr int SCHED_TIMEOUT_MS = 50;
 
+/// Instruction-budget reload value for emitted loop-back-edge preemption
+/// points (#66, design approach (a)). The emitter decrements
+/// `ctx->preempt_budget` once per loop back-edge pass; when it reaches <= 0 the
+/// generated code calls `sched_preempt()`, which reloads it to this value. This
+/// is a generic, title-agnostic constant (purity gate): ~100k back-edge passes
+/// between reschedule checks keeps the dead-effect counter overhead negligible
+/// on straight-line-dominated code while bounding how long a syscall-free spin
+/// runs before reaching a preemption point once the flag is enabled.
+static constexpr int32_t SCHED_PREEMPT_BUDGET = 100000;
+
 /// Per-thread state for PSP cooperative scheduler.
 /// Each thread gets its own recomp_context (RUNTIME-01) so register state
 /// is naturally isolated without save/restore.
@@ -88,6 +98,17 @@ int psp_thread_start(int thid);
 /// Finds highest-priority READY thread and context-switches to it.
 /// Uses 50ms timedwait safety valve (RUNTIME-06).
 void sched_yield_point();
+
+/// Instruction-budget preemption hook (#66, design approach (a)) — called from
+/// emitted code at loop back-edges when `ctx->preempt_budget` hits <= 0.
+/// DEFAULT-OFF: with the `PSPRECOMP_PREEMPT` env var unset or "0" this only
+/// reloads `ctx->preempt_budget` to SCHED_PREEMPT_BUDGET and returns (no yield),
+/// so the decrement is a dead effect and Patapon behavior is unchanged. When
+/// `PSPRECOMP_PREEMPT=1` it reloads the budget and additionally takes a fair
+/// cooperative yield (step 3 wires the real preemptive yield; today the enabled
+/// path reuses `sched_yield_point()`). Always resets the budget so the spin loop
+/// does not call back every iteration.
+void sched_preempt(recomp_context* ctx);
 
 /// Mark current thread DEAD, decrement g_alive_threads, wake next thread.
 void psp_thread_exit_current();

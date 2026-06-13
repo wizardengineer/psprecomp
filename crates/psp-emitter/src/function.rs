@@ -506,6 +506,19 @@ pub fn emit_function(func: &DecodedFunction, gen: &mut dyn Generator, imports: &
             let instr_vaddr = block.vaddr.saturating_add(i as u32 * 4);
             gen.emit_label(&format!("L_{instr_vaddr:08X}"));
 
+            // Instruction-budget preemption point (#66, design approach (a)):
+            // if this op is an in-function loop back-edge (static target at or
+            // before this address), emit the budget decrement + sched_preempt
+            // check BEFORE the branch, so a syscall-free busy-poll loop (the
+            // .hack CRI-ring consumer) reaches a reschedule point on a bounded
+            // budget. DEFAULT-OFF: sched_preempt is a no-op unless
+            // PSPRECOMP_PREEMPT=1, so this leaves guest behavior identical.
+            // Covers all three lowering paths below (BIDS, likely, plain) since
+            // each emits the op at `instrs[i]`.
+            if backward_branch_target(&instrs[i], instr_vaddr, func.vaddr).is_some() {
+                emit_preempt_point(gen);
+            }
+
             // BIDS pairing (issue #56): the next node is a DelaySlotRejoin —
             // this branch's delay-slot ADDRESS is itself a branch target.
             // Emit the branch/delay block at this position, an unconditional
@@ -641,6 +654,56 @@ fn is_terminal_external_jal(seq: &[MipsOp], i: usize, func_start: u32, func_end:
 /// True if `r` is the hardwired-zero register.
 fn is_zero_reg(r: Reg) -> bool {
     matches!(r, Reg::Zero | Reg::Gpr(0))
+}
+
+/// Detect an in-function loop back-edge: a control op whose static target lies
+/// at-or-before its own positional address (`target <= instr_vaddr`) and within
+/// the function (`target >= func_start`). This is the structural signature of a
+/// loop's bottom branch — including a degenerate `b .` busy-poll spin (the .hack
+/// CRI-ring consumer, #66).
+///
+/// Returns the back-edge `target` when `op` is such a branch, else `None`.
+/// Conditional branches (beq/bne/bgez/.../bc1t/bc1f) and unconditional jumps
+/// (`j`) are considered; `jal`/`bltzal`/`bgezal` (calls/links) and register-
+/// indirect jumps (`jr`/`jalr`, no static target) are NOT — a call is forward
+/// progress, and an indirect jump has no statically-known back-edge to gate on.
+/// A `BranchHazardDelay` is unwrapped to its inner branch.
+///
+/// # Arguments
+///
+/// * `op` - the candidate control op at `instr_vaddr`.
+/// * `instr_vaddr` - positional virtual address of `op`.
+/// * `func_start` - function entry vaddr (lower bound for an in-function target).
+fn backward_branch_target(op: &MipsOp, instr_vaddr: u32, func_start: u32) -> Option<u32> {
+    let target = match op {
+        MipsOp::Beq { target, .. }
+        | MipsOp::Bne { target, .. }
+        | MipsOp::Bgez { target, .. }
+        | MipsOp::Bgtz { target, .. }
+        | MipsOp::Blez { target, .. }
+        | MipsOp::Bltz { target, .. }
+        | MipsOp::Bc1t { target, .. }
+        | MipsOp::Bc1f { target, .. }
+        | MipsOp::J { target } => *target,
+        MipsOp::BranchHazardDelay { branch, .. } => {
+            return backward_branch_target(branch, instr_vaddr, func_start);
+        }
+        _ => return None,
+    };
+    if target >= func_start && target <= instr_vaddr {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// Emit the instruction-budget preemption point (#66, design approach (a)) for a
+/// loop back-edge. The decrement is a dead-effect counter and `sched_preempt`
+/// is a no-op unless `PSPRECOMP_PREEMPT=1` (see runtime `psp_scheduler.cpp`), so
+/// the FLAG-OFF default leaves guest behavior identical. Placed before the
+/// back-edge branch so every loop-bottom pass counts one iteration.
+fn emit_preempt_point(gen: &mut dyn Generator) {
+    gen.emit_raw("if (--ctx->preempt_budget <= 0) sched_preempt(ctx);");
 }
 
 /// True if the emitted lowering of `op` unconditionally ends guest control
@@ -1854,6 +1917,139 @@ mod tests {
         emit_function(&func, &mut gen, &ImportMap::new());
         let joined = gen.output.join("\n");
         assert!(joined.contains('+'), "addu should emit '+' expression");
+    }
+
+    // --- Instruction-budget preemption points (#66, design approach (a)) -----
+
+    /// A backward conditional branch (target <= its own address) is a loop
+    /// back-edge: the emitter must inject the budget-decrement preemption point.
+    #[test]
+    fn backward_branch_emits_preempt_point() {
+        let mut gen = TestGenerator::new();
+        // size=8: op@vaddr (nop), op@vaddr+4 (beq back to vaddr) — a 2-instr loop.
+        let mut func = make_func(vec![
+            MipsOp::Nop {},
+            MipsOp::Beq {
+                rs: Reg::Gpr(4),
+                rt: Reg::Gpr(5),
+                target: 0x08804000, // back-edge to func start (<= 0x08804004)
+                likely: false,
+            },
+        ]);
+        func.size = 8;
+        emit_function(&func, &mut gen, &ImportMap::new());
+        let joined = gen.output.join("\n");
+        assert!(
+            joined.contains("--ctx->preempt_budget") && joined.contains("sched_preempt(ctx)"),
+            "backward branch must emit a preemption point; got:\n{joined}"
+        );
+    }
+
+    /// A degenerate self-loop (`b .`, target == own address) is the busy-poll
+    /// spin shape (.hack CRI ring); it must still get a preemption point.
+    #[test]
+    fn self_loop_emits_preempt_point() {
+        let mut gen = TestGenerator::new();
+        let func = make_func(vec![MipsOp::Beq {
+            rs: Reg::Zero,
+            rt: Reg::Zero,
+            target: 0x08804000, // == this op's own address
+            likely: false,
+        }]);
+        emit_function(&func, &mut gen, &ImportMap::new());
+        let joined = gen.output.join("\n");
+        assert!(
+            joined.contains("--ctx->preempt_budget"),
+            "self-loop spin must emit a preemption point; got:\n{joined}"
+        );
+    }
+
+    /// A forward-only function (no branch whose target precedes it) must NOT
+    /// gain any preemption point — straight-line code stays cost-free.
+    #[test]
+    fn forward_only_emits_no_preempt_point() {
+        let mut gen = TestGenerator::new();
+        // forward beq (target after the branch) + an arithmetic op.
+        let mut func = make_func(vec![
+            MipsOp::Beq {
+                rs: Reg::Gpr(4),
+                rt: Reg::Gpr(5),
+                target: 0x08804008, // forward (> 0x08804000)
+                likely: false,
+            },
+            MipsOp::Addu { rd: Reg::Gpr(2), rs: Reg::Gpr(4), rt: Reg::Gpr(5) },
+        ]);
+        func.size = 8;
+        emit_function(&func, &mut gen, &ImportMap::new());
+        let joined = gen.output.join("\n");
+        assert!(
+            !joined.contains("preempt_budget"),
+            "forward-only function must emit no preemption point; got:\n{joined}"
+        );
+    }
+
+    /// Unit-level coverage of the back-edge predicate: backward/self in range
+    /// hit; forward, out-of-range, and calls/links/indirect jumps do not.
+    #[test]
+    fn backward_branch_target_predicate() {
+        let start = 0x08804000;
+        let at = 0x08804010; // the branch's own positional address
+        // Backward in-range -> Some.
+        assert_eq!(
+            backward_branch_target(
+                &MipsOp::Beq { rs: Reg::Gpr(1), rt: Reg::Gpr(2), target: start, likely: false },
+                at,
+                start,
+            ),
+            Some(start)
+        );
+        // Self-loop (target == at) -> Some.
+        assert_eq!(
+            backward_branch_target(&MipsOp::J { target: at }, at, start),
+            Some(at)
+        );
+        // Forward (target > at) -> None.
+        assert_eq!(
+            backward_branch_target(&MipsOp::J { target: 0x08804020 }, at, start),
+            None
+        );
+        // Backward but BELOW func start (out of function) -> None.
+        assert_eq!(
+            backward_branch_target(&MipsOp::J { target: 0x08800000 }, at, start),
+            None
+        );
+        // jal/bltzal/bgezal are calls/links, not loop back-edges -> None.
+        assert_eq!(backward_branch_target(&MipsOp::Jal { target: start }, at, start), None);
+        assert_eq!(
+            backward_branch_target(
+                &MipsOp::Bltzal { rs: Reg::Gpr(4), target: start, likely: false },
+                at,
+                start,
+            ),
+            None
+        );
+        // Register-indirect jump has no static target -> None.
+        assert_eq!(
+            backward_branch_target(&MipsOp::Jr { rs: Reg::Gpr(31) }, at, start),
+            None
+        );
+        // Hazard-fused backward branch unwraps to its inner branch -> Some.
+        assert_eq!(
+            backward_branch_target(
+                &MipsOp::BranchHazardDelay {
+                    branch: Box::new(MipsOp::Bne {
+                        rs: Reg::Gpr(1),
+                        rt: Reg::Gpr(2),
+                        target: start,
+                        likely: false,
+                    }),
+                    delay: Box::new(MipsOp::Nop {}),
+                },
+                at,
+                start,
+            ),
+            Some(start)
+        );
     }
 
     #[test]
