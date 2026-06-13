@@ -318,6 +318,10 @@ static void hle_sceKernelWaitSema(
     }
 
     s->wait_count++;
+    // Single-runnable token (PSPRECOMP_PREEMPT): hand the run-token to a peer
+    // before parking on the sema condvar; reclaim it on every exit path below.
+    // No-op when the flag is OFF (byte-identical default path).
+    sched_token_release_for_wait();
     if (timeout_ptr != 0) {
         uint32_t timeout_us = psp_mem_read<uint32_t>(
             rdram, timeout_ptr);
@@ -331,6 +335,7 @@ static void hle_sceKernelWaitSema(
             sema_remove_waiter(*s, &waiter);
             s->wait_count--;
             psp_thread_clear_wait();
+            sched_token_reacquire_after_wait();
             ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
             return;
         }
@@ -349,12 +354,14 @@ static void hle_sceKernelWaitSema(
             sema_remove_waiter(*s, &waiter);
             s->wait_count--;
             psp_thread_clear_wait();
+            sched_token_reacquire_after_wait();
             ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
             return;
         }
     }
     s->wait_count--;
     psp_thread_clear_wait();
+    sched_token_reacquire_after_wait();
 
     // Granted: the signaller already transferred the count to us --
     // do NOT decrement current_count here.
@@ -443,10 +450,14 @@ static void hle_sceKernelWaitSemaCB(
             // cv.wait_for wakes immediately on notify_all() from
             // SignalSema — much faster than sleep_for.
             s->wait_count++;
+            // Single-runnable token (PSPRECOMP_PREEMPT): release across the
+            // poll-loop park so peers advance; reclaim on wake. No-op when OFF.
+            sched_token_release_for_wait();
             s->cv.wait_for(lock, std::chrono::milliseconds(5),
                 [&] { return (s->current_count >= signal
                               && s->waiters.empty())
                              || g_should_exit.load(); });
+            sched_token_reacquire_after_wait();
             s->wait_count--;
             // Do NOT decrement here — re-check at top of loop
         }

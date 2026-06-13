@@ -16,6 +16,124 @@ static PspThread g_threads[MAX_THREADS];
 /// Each OS thread knows its own PspThread without shared state lookup.
 static thread_local PspThread* g_current = nullptr;
 
+// ===========================================================================
+// Single-runnable token (approach (d), SCHEDULER-DESIGN.md §4(d)) — FLAG-GATED.
+//
+// When PSPRECOMP_PREEMPT=1, exactly one PSP thread may execute guest code at a
+// time, restoring PSP single-CPU interleaving + ordered cross-thread hand-off
+// (the .hack CRI-ring fix). When the flag is OFF (default) NONE of this is
+// engaged: token_acquire/token_release_to are no-ops and the scheduler behaves
+// byte-identically to the pre-token parallel model (the Patapon-default gate).
+//
+// "Hold the token" == g_token_holder == self. A thread acquires by parking on
+// its own cv until granted; a thread releases by SELECTING a runnable peer and
+// transferring the token to it (deadlock-free: a blocking/yielding holder always
+// hands the token to a selected peer BEFORE it waits). If no peer is runnable,
+// the holder keeps the token (never release into the void).
+// ===========================================================================
+
+/// Current token holder, guarded by g_sched_mutex. nullptr == free (only at
+/// startup before the first thread acquires, or after the last thread exits).
+static PspThread* g_token_holder = nullptr;
+
+/// Read once, cached. Mirrors sched_preempt_enabled() — declared here so token
+/// helpers can gate on it; the canonical reader is sched_preempt_enabled below.
+static bool token_enabled();
+
+/// Within-priority round-robin cursor: index after the last thread that was
+/// granted the token, so equal-priority peers take turns (PPSSPP pop_first).
+static int g_rr_cursor = 0;
+
+/// Select the next thread to receive the token: highest-priority READY/RUNNING
+/// thread (lowest priority number), round-robin within a priority, excluding
+/// `exclude`. Returns nullptr if none runnable. Caller holds g_sched_mutex.
+static PspThread* select_next_runnable(PspThread* exclude) {
+    PspThread* best = nullptr;
+    // Scan starting just after the RR cursor so equal-priority peers rotate.
+    for (int n = 0; n < MAX_THREADS; n++) {
+        int i = (g_rr_cursor + 1 + n) % MAX_THREADS;
+        PspThread& t = g_threads[i];
+        if (!t.in_use || &t == exclude) {
+            continue;
+        }
+        // Runnable == will execute guest code: READY or RUNNING. Exclude
+        // token_parked threads — they released the token and are blocked on a
+        // foreign object cv (sema/eventflag) or sleeping; granting the token to
+        // them would lose it (they will not wake to run guest code). A thread
+        // parked in token_acquire (token_parked stays false there) IS eligible:
+        // it parks on its own cv and the grant notify wakes it.
+        if (t.token_parked) {
+            continue;
+        }
+        if (t.status != READY && t.status != RUNNING) {
+            continue;
+        }
+        if (!best || t.priority < best->priority) {
+            best = &t;
+        }
+    }
+    return best;
+}
+
+/// Transfer the token from the current holder to a selected runnable peer and
+/// wake it. Caller holds g_sched_mutex. No-op when the flag is OFF. If no peer
+/// is runnable the holder keeps the token (the caller must then NOT block, or
+/// will park harmlessly on its own cv with the 50ms safety valve).
+static void token_release_to(PspThread* self) {
+    if (!token_enabled()) {
+        return;
+    }
+    PspThread* next = select_next_runnable(self);
+    if (!next) {
+        return;  // No runnable peer — keep the token (don't release into void).
+    }
+    g_token_holder = next;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (&g_threads[i] == next) {
+            g_rr_cursor = i;
+            break;
+        }
+    }
+    next->cv.notify_one();
+}
+
+/// Park on self's cv until self holds the token (or shutdown). Caller holds
+/// g_sched_mutex via `lock`. No-op when the flag is OFF. Used after a release
+/// to re-contend, and at first run to take the initial token.
+static void token_acquire(std::unique_lock<std::mutex>& lock, PspThread* self) {
+    if (!token_enabled()) {
+        return;
+    }
+    // First-ever acquire: if the token is free, take it directly.
+    if (g_token_holder == nullptr) {
+        g_token_holder = self;
+        self->token_parked = false;
+        return;
+    }
+    while (g_token_holder != self && !g_should_exit.load()) {
+        self->cv.wait_for(lock, std::chrono::milliseconds(SCHED_TIMEOUT_MS));
+        // Safety valve: if nobody holds the token, claim it.
+        if (g_token_holder == nullptr) {
+            g_token_holder = self;
+        }
+    }
+    self->token_parked = false;  // Holding the token now → eligible/running.
+}
+
+/// Release the token held by `self` to a peer, then re-acquire (block until
+/// granted again). The unified hand-off used at every voluntary reschedule
+/// point. Caller holds g_sched_mutex via `lock`. No-op when the flag is OFF.
+static void token_handoff(std::unique_lock<std::mutex>& lock, PspThread* self) {
+    if (!token_enabled() || g_token_holder != self) {
+        return;
+    }
+    token_release_to(self);
+    if (g_token_holder == self) {
+        return;  // Kept it (no runnable peer) — no need to park.
+    }
+    token_acquire(lock, self);
+}
+
 // ---------------------------------------------------------------------------
 // psp_scheduler_init — zero all 64 slots
 // ---------------------------------------------------------------------------
@@ -131,6 +249,14 @@ static void thread_entry_wrapper(PspThread* t) {
     // Register context (SP, k0, args) set by hle_sceKernelStartThread
     // before psp_thread_start() was called. Do not reinitialize here.
 
+    // Single-runnable token (flag-gated, no-op when OFF): a PSP thread must hold
+    // the token to execute guest code. Acquire it before entering guest code;
+    // every yield/block/exit hands it off, every resume re-acquires.
+    {
+        std::unique_lock<std::mutex> lock(g_sched_mutex);
+        token_acquire(lock, t);
+    }
+
     // Call the recompiled PSP entry function via dispatch table.
     // Catch PspThreadExitException -- thrown by sceKernelExitThread
     // to implement "never returns" semantics. On the real PSP,
@@ -169,6 +295,16 @@ void sched_yield_point() {
 
     std::unique_lock<std::mutex> lock(g_sched_mutex);
 
+    // Single-runnable path (flag ON): the unified token hand-off. Release the
+    // token to the selected runnable peer (priority + within-priority RR) and
+    // block until re-granted. Deadlock-free: token_handoff selects+grants BEFORE
+    // it parks, and keeps the token if no peer is runnable.
+    if (token_enabled()) {
+        token_handoff(lock, g_current);
+        return;
+    }
+
+    // ---- Default parallel path (flag OFF) — byte-identical to pre-token ----
     // Find highest-priority READY thread (lowest priority number)
     PspThread* best = nullptr;
     for (int i = 0; i < MAX_THREADS; i++) {
@@ -236,6 +372,11 @@ static bool sched_preempt_enabled() {
     return enabled;
 }
 
+/// Token gate uses the same flag (read once, cached) as the preempt hook.
+static bool token_enabled() {
+    return sched_preempt_enabled();
+}
+
 void sched_preempt(recomp_context* ctx) {
     // Always reload first: a syscall-free spin must not call back every
     // iteration, and this self-primes the memset-zero initial budget.
@@ -251,6 +392,38 @@ void sched_preempt(recomp_context* ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// sched_token_release_for_wait / _reacquire_after_wait — HLE object-cv parks
+//
+// Called by HLE wait stubs that park on their own object condvar (not the
+// scheduler WAIT path) around the wait_for. Flag-gated no-ops when OFF. Takes
+// g_sched_mutex internally — must NOT be called while it is held. The thread's
+// scheduler status is left untouched (the HLE stub manages its own object
+// waiter bookkeeping); only the run-token is handed off / reclaimed.
+// ---------------------------------------------------------------------------
+void sched_token_release_for_wait() {
+    if (!token_enabled() || !g_current) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(g_sched_mutex);
+    // Mark ineligible: this thread is about to park on a foreign object cv
+    // (sema/eventflag), so the token must NOT be handed back to it until it
+    // re-acquires via sched_token_reacquire_after_wait().
+    g_current->token_parked = true;
+    if (g_token_holder == g_current) {
+        g_token_holder = nullptr;
+        token_release_to(g_current);
+    }
+}
+
+void sched_token_reacquire_after_wait() {
+    if (!token_enabled() || !g_current) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(g_sched_mutex);
+    token_acquire(lock, g_current);
+}
+
+// ---------------------------------------------------------------------------
 // psp_thread_exit_current — mark DEAD, decrement counter, wake next
 // ---------------------------------------------------------------------------
 void psp_thread_exit_current() {
@@ -261,6 +434,15 @@ void psp_thread_exit_current() {
 
     g_current->status = DEAD;
     g_alive_threads.fetch_sub(1);
+
+    // Token hand-off (flag-gated): an exiting holder must transfer the token to
+    // a runnable peer so guest execution does not stall. If this thread is not
+    // the holder (OFF, or token elsewhere) this is a no-op. If no peer is
+    // runnable the token is left free (token_acquire's safety valve reclaims it).
+    if (token_enabled() && g_token_holder == g_current) {
+        g_token_holder = nullptr;
+        token_release_to(g_current);  // selects+grants a peer (excludes self)
+    }
 
     // Find next READY thread and wake it
     for (int i = 0; i < MAX_THREADS; i++) {
@@ -375,6 +557,16 @@ int psp_thread_sleep_current() {
     std::strncpy(g_current->wait_reason, "sleep",
                  sizeof(g_current->wait_reason) - 1);
 
+    PspThread* self = g_current;
+
+    // Token hand-off (flag-gated): a blocking holder transfers the token to a
+    // runnable peer BEFORE it parks, so guest execution continues. WAIT_SLEEP
+    // is excluded from select_next_runnable, so self cannot re-receive it here.
+    if (token_enabled() && g_token_holder == self) {
+        g_token_holder = nullptr;
+        token_release_to(self);
+    }
+
     // Wake next READY thread before sleeping (prevents deadlock)
     for (int i = 0; i < MAX_THREADS; i++) {
         PspThread& t = g_threads[i];
@@ -386,7 +578,6 @@ int psp_thread_sleep_current() {
     }
 
     // Block until woken (5s safety valve)
-    PspThread* self = g_current;
     self->cv.wait_for(
         lock,
         std::chrono::seconds(5),
@@ -404,6 +595,9 @@ int psp_thread_sleep_current() {
             "triggered\n", self->id, self->name);
     }
     self->wait_reason[0] = '\0';
+
+    // Re-acquire the token before returning to guest code (flag-gated no-op OFF).
+    token_acquire(lock, self);
 
     return 0;
 }
@@ -460,6 +654,12 @@ int psp_thread_wait_end(int thid, int timeout_us) {
     std::snprintf(self->wait_reason, sizeof(self->wait_reason),
                   "thread_end:%d", thid);
 
+    // Token hand-off (flag-gated): release to a runnable peer before parking.
+    if (token_enabled() && g_token_holder == self) {
+        g_token_holder = nullptr;
+        token_release_to(self);
+    }
+
     for (int i = 0; i < MAX_THREADS; i++) {
         PspThread& other = g_threads[i];
         if (other.in_use && other.status == READY &&
@@ -486,6 +686,9 @@ int psp_thread_wait_end(int thid, int timeout_us) {
 
     self->status = RUNNING;
     self->wait_reason[0] = '\0';
+
+    // Re-acquire the token before returning to guest code (flag-gated no-op OFF).
+    token_acquire(lock, self);
 
     if (!done && t.status != DEAD && t.in_use) {
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;

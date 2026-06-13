@@ -75,6 +75,12 @@ struct PspThread {
     char name[32];              ///< Thread name for debugging
     char wait_reason[24];       ///< Why the thread is blocked (e.g. "sema:259",
                                 ///< "sleep"); diagnostics only, racy reads OK
+    bool token_parked = false;  ///< [approach (d)] This thread released the
+                                ///< run-token and is parked (on its own cv or a
+                                ///< foreign object cv) — NOT eligible to receive
+                                ///< the token until it re-contends. Guarded by
+                                ///< g_sched_mutex. Unused when PSPRECOMP_PREEMPT
+                                ///< is OFF.
 };
 
 /// Initialize scheduler — zero all 64 thread slots.
@@ -109,6 +115,19 @@ void sched_yield_point();
 /// path reuses `sched_yield_point()`). Always resets the budget so the spin loop
 /// does not call back every iteration.
 void sched_preempt(recomp_context* ctx);
+
+/// Single-runnable token hand-off helpers (approach (d), PSPRECOMP_PREEMPT).
+/// HLE wait stubs that park the CURRENT thread on their OWN object condvar
+/// (event-flag `ef->cv`, sema `s->cv`) — i.e. NOT through the scheduler's
+/// WAIT path — must release the run-token to a runnable peer before parking and
+/// re-acquire it after waking, or guest execution stalls under the flag. Both
+/// are NO-OPS when PSPRECOMP_PREEMPT is unset (default), so the OFF path is
+/// byte-identical. Call `sched_token_release_for_wait()` immediately before the
+/// object-cv `wait_for`, and `sched_token_reacquire_after_wait()` immediately
+/// after it returns. These take the scheduler mutex internally and must NOT be
+/// called while it is already held.
+void sched_token_release_for_wait();
+void sched_token_reacquire_after_wait();
 
 /// Mark current thread DEAD, decrement g_alive_threads, wake next thread.
 void psp_thread_exit_current();

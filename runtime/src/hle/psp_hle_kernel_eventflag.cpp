@@ -187,9 +187,14 @@ static void hle_sceKernelWaitEventFlag(
     // Waiter census for sceKernelReferEventFlagStatus's numWaitThreads
     // (read-side bookkeeping only — no control-flow change).
     ef->num_wait_threads++;
+    // Single-runnable token (PSPRECOMP_PREEMPT): release the run-token to a
+    // peer before parking on the event-flag condvar, reclaim it on wake.
+    // No-op when the flag is OFF (byte-identical default path).
+    sched_token_release_for_wait();
     bool matched = ef->cv.wait_for(lock, std::chrono::seconds(5), [&] {
         return pattern_matches(ef->pattern, bits, wait_mode);
     });
+    sched_token_reacquire_after_wait();
     ef->num_wait_threads--;
     auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - wait_start).count();
