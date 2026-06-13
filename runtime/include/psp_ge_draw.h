@@ -1,6 +1,27 @@
 #pragma once
 #include <cstdint>
 
+/// Computed GL viewport rectangle (FBO pixels, GL bottom-left origin) and
+/// depth range, derived from the PSP viewport scale/offset + depth registers.
+struct GeViewportDepth {
+    int x, y, w, h;       // glViewport args (FBO pixels)
+    float near_z, far_z;  // glDepthRange args, clamped to [0,1]
+};
+
+/// Pure math: PSP viewport scale/offset + depth -> GL viewport + depth range
+/// (issue #23). Mirrors PPSSPP ConvertViewportAndScissor for the 1:1,
+/// non-supersampled, non-accurate-depth FBO case. Separated from the GL call
+/// site (apply in ge_draw_prim) so it is unit-testable without a GL context.
+/// off_x_raw/off_y_raw are the raw OFFSETX/OFFSETY register words (1/16
+/// subpixel, low 16 bits used). fb_height is the render-target height in
+/// pixels (PSP top-left origin is flipped to GL bottom-left).
+GeViewportDepth ge_compute_viewport_depth(
+    float vp_x_scale, float vp_y_scale,
+    float vp_x_center, float vp_y_center,
+    float vp_z_scale, float vp_z_center,
+    uint32_t off_x_raw, uint32_t off_y_raw,
+    int fb_height);
+
 /// Initialize the GE draw infrastructure: FBO, VAO/VBO, shader.
 /// Must be called after SDL/GL init and after ge_init()/ge_texture_init().
 void ge_draw_init();

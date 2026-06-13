@@ -175,10 +175,17 @@ World/view are 4x3 matrices, projection is 4x4, all uploaded **column-major** vi
 point; the column-major convention is load-bearing. After projection, a perspective divide by
 `clip.w` produces NDC (skipped when `|w| < 1e-6`).
 
-Note that the PSP viewport registers (`VIEWPORTXSCALE` etc.) and screen offset
-(`OFFSETX`/`OFFSETY`) are tracked in `GeState` but never applied: the CPU transform emits NDC
-directly and the GL viewport is always the full 480x272 FBO. This is equivalent only while
-games use a full-screen viewport.
+After projection produces NDC, transform-mode draws map through the PSP viewport registers
+(`VIEWPORTXSCALE/YSCALE/XCENTER/YCENTER`) and screen offset (`OFFSETX`/`OFFSETY`, 1/16
+subpixel) to `glViewport`, and the depth range (`VIEWPORTZSCALE/ZCENTER`) to `glDepthRange`
+(`ge_compute_viewport_depth` in `psp_ge_viewport.cpp`, applied per-PRIM in `ge_draw_prim`,
+issue #23). The mapping mirrors PPSSPP's `ConvertViewportAndScissor` for the 1:1, non-accurate
+-depth FBO: `left = vpXCenter - offsetX - |vpXScale|`, `w = |2·vpXScale|` (PSP top-left flipped
+to GL bottom-left), depth `[(vpZCenter-vpZScale), (vpZCenter+vpZScale)]/65535`. For a full-screen
+viewport this reduces to the previous `glViewport(0,0,480,272)`. Through-mode (2D/sprite) draws
+already bake the full-screen 240/136 mapping into NDC, so they keep the full-buffer viewport and
+an identity depth range. (`MINZ`/`MAXZ` are now stored in `GeState` but the active depth range
+uses the viewport Z registers, per PPSSPP's non-accurate-depth path.)
 
 In both modes, UVs are post-processed with `TEXSCALEU/V` and `TEXOFFSETU/V`.
 
@@ -297,8 +304,10 @@ a pure pass-through (`gl_Position = vec4(a_position, 1.0)`) because all transfor
 happened on the CPU.
 
 The render target is a 480x272 RGBA8 FBO with a 24-bit depth renderbuffer, created once at
-startup (`ge_draw_init`); `ge_draw_begin_list` binds it and sets the viewport at the start of
-every list.
+startup (`ge_draw_init`); `ge_draw_begin_list` binds it and sets a full-buffer default viewport
+at the start of every list. The precise per-draw viewport and depth range are applied in
+`ge_draw_prim` from the live PSP viewport/depth registers (issue #23), since those registers may
+be set after `begin_list`.
 
 ## Threading and Present
 
@@ -376,8 +385,9 @@ consequence of each. "Tracked" means the register value is stored in `GeState`.
 | `TEXFILTER` / `TEXWRAP` | tracked, sampler fixed at NEAREST + CLAMP_TO_EDGE | no bilinear filtering, no UV repeat/mirror |
 | Stencil (`STENCILTEST`/`STENCILOP`) | tracked, no GL stencil calls | stencil-masked effects missing; FBO has no stencil attachment |
 | Scissor / region / screen offset | tracked, never applied | draws are never clipped to sub-rectangles |
-| Viewport registers | tracked, never applied (CPU emits NDC; GL viewport fixed 480x272) | only correct for full-screen viewports |
-| Color test, logic op, dither, `MASKRGB`/`MASKALPHA`, `MINZ`/`MAXZ` | ignored | corresponding per-fragment effects missing |
+| Viewport registers (transform mode) | **applied** — scale/offset → `glViewport`, Z scale/center → `glDepthRange` (`ge_compute_viewport_depth`, issue #23) | transformed geometry lands at the correct screen position and depth; through-mode 2D still uses the baked full-screen NDC mapping |
+| Color test, logic op, dither, `MASKRGB`/`MASKALPHA` | ignored | corresponding per-fragment effects missing |
+| `MINZ`/`MAXZ` (depth-range clamp) | stored; active depth range derived from viewport Z (PPSSPP non-accurate-depth path) | per-fragment depth clamp not applied |
 | Fog (`FOG1`/`FOG2` ignored; color stored) | no shader fog | fogged scenes render unfogged |
 | `DOUBLE*` blend factors, `ABSDIFF` blend op, FIXB blend constant | approximated (see raster table) | subtle blending differences vs. hardware |
 | Clear-mode rectangle extent | full-buffer `glClear` | partial clears clear the whole screen |

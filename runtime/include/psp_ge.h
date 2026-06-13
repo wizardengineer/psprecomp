@@ -53,9 +53,10 @@ struct GeState {
     float viewport_x_center, viewport_y_center, viewport_z_center;
     float tex_scale_u, tex_scale_v;
     float tex_offset_u, tex_offset_v;
-    uint32_t offset_x, offset_y;    // GE_CMD_OFFSETX/Y
+    uint32_t offset_x, offset_y;    // GE_CMD_OFFSETX/Y (1/16 subpixel)
     uint32_t region1, region2;       // GE_CMD_REGION1/2
     uint32_t scissor1, scissor2;     // GE_CMD_SCISSOR1/2
+    uint32_t min_z, max_z;           // GE_CMD_MINZ/MAXZ: depth range (u16)
 
     // -- Framebuffer --
     uint32_t framebuf_ptr;    // GE_CMD_FRAMEBUFPTR

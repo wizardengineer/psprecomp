@@ -210,6 +210,26 @@ static GLenum map_prim_type(int prim_type) {
     }
 }
 
+// PSP-native render-target dimensions. The runtime always renders into a
+// 480x272 FBO at 1:1 PSP resolution; window upscaling happens later at
+// present (blit). So the NDC->screen viewport maps directly to FBO pixels.
+static constexpr int PSP_FB_WIDTH = 480;
+static constexpr int PSP_FB_HEIGHT = 272;
+
+// Apply the PSP viewport scale/offset -> glViewport and the depth-range
+// registers -> glDepthRange. Generic for all games (issue #23). The math
+// lives in the pure ge_compute_viewport_depth (below) so it is unit-testable
+// without a GL context; this wrapper just issues the GL calls.
+static void apply_viewport_and_depth(const GeState& state) {
+    const GeViewportDepth vp = ge_compute_viewport_depth(
+        state.viewport_x_scale, state.viewport_y_scale,
+        state.viewport_x_center, state.viewport_y_center,
+        state.viewport_z_scale, state.viewport_z_center,
+        state.offset_x, state.offset_y, PSP_FB_HEIGHT);
+    glViewport(vp.x, vp.y, vp.w, vp.h);
+    glDepthRange(vp.near_z, vp.far_z);
+}
+
 // ---- Public API ----
 
 void ge_draw_init() {
@@ -355,7 +375,10 @@ void ge_draw_shutdown() {
 
 void ge_draw_begin_list() {
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-    glViewport(0, 0, 480, 272);
+    // Full-buffer default; the precise PSP viewport (scale/offset + depth
+    // range) is applied per-PRIM in ge_draw_prim from the live registers,
+    // which may be set after begin_list (issue #23).
+    glViewport(0, 0, PSP_FB_WIDTH, PSP_FB_HEIGHT);
     g_frame_counter++;
 }
 
@@ -541,6 +564,19 @@ void ge_draw_prim(
         glClear(clear_bits);
         g_has_drawn_prims = true;  // Clear counts as drawing
         return;
+    }
+
+    // Viewport / depth-range (issue #23). Transform-mode draws emit NDC via
+    // the real MVP path, so they must map through the PSP viewport
+    // scale/offset + depth range to land on screen. Through-mode (2D/sprite)
+    // already bakes the full-screen 240/136 mapping into NDC in
+    // ge_transform_vertices, so it keeps the full-buffer viewport set by
+    // ge_draw_begin_list and an identity depth range.
+    if (!ge_vtype_through(state.vertex_type)) {
+        apply_viewport_and_depth(state);
+    } else {
+        glViewport(0, 0, PSP_FB_WIDTH, PSP_FB_HEIGHT);
+        glDepthRange(0.0, 1.0);
     }
 
     // Decode vertices
