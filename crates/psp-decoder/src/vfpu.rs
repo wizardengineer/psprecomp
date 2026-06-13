@@ -309,8 +309,25 @@ pub(crate) fn decode_vfpu3(
 
 /// Decode VFPU4 group (opcode 0x34).
 ///
-/// This is the most complex decode function. Primary dispatch on bits
-/// 25:23, then further sub-dispatch on bits 20:16 and 22:21.
+/// Dispatch matches PPSSPP `tableVFPU4Jump`, indexed by the 5-bit field
+/// `bits[25:21]` (`EncodingBitsInfo(21, 5)` in MIPSTables.cpp):
+///
+/// | idx   | group                                                  |
+/// |-------|--------------------------------------------------------|
+/// | 0     | VFPU4 unary (mov/abs/.../rcp/rsq/sin/.../sqrt/asin)     |
+/// | 1     | VFPU7 (vrnd*, vf2h/vh2f, v*2i / vi2*)                   |
+/// | 2     | VFPU9 (vsrt*, vbfy*, vocp/vsocp, vfad, vavg, ...)       |
+/// | 3     | vcst (constant load)                                   |
+/// | 16-19 | vf2in / vf2iz / vf2iu / vf2id                          |
+/// | 20    | vi2f                                                   |
+/// | 21    | vcmov                                                  |
+/// | 24-31 | vwbn                                                   |
+///
+/// The previous implementation indexed on the 3-bit `bits[25:23]` field,
+/// which collapsed idx 0-3 onto one handler and mis-split idx 16-31 — so
+/// vf2i*, vi2f, vcmov, vcst, vocp, vfad, vavg, vsrt*, vbfy* and vwbn all
+/// decoded to the wrong op (e.g. vcmov decoded as vf2iz, silently
+/// re-zeroing the rsqrt scale in sceGumLookAt's safe-normalize idiom).
 pub(crate) fn decode_vfpu4(
     word: u32,
     vaddr: u32,
@@ -318,31 +335,58 @@ pub(crate) fn decode_vfpu4(
     let d = vd(word);
     let s = vs(word);
     let sz = vec_size(word);
-    let primary = (word >> 23) & 7;
+    let idx = (word >> 21) & 0x1F;
+    let imm5 = ((word >> 16) & 0x1F) as u8;
 
-    match primary {
-        0 => decode_vfpu4_type0(word, d, s, sz, vaddr),
-        1 => decode_vfpu4_type1(word, d, s, sz, vaddr),
-        2 => decode_vfpu4_type2(word, d, s, sz, vaddr),
-        3 => decode_vfpu4_type3(word, d, s, sz, vaddr),
-        4 => decode_vfpu4_type4(word, d, s, sz, vaddr),
-        5 => decode_vfpu4_type5(word, d, s, sz, vaddr),
-        6 => decode_vfpu4_type6(word, d, s, sz, vaddr),
-        7 => decode_vfpu4_type7(word, d, s, sz, vaddr),
-        _ => Ok(MipsOp::VfpuUnknown {
+    let unknown = || {
+        Ok(MipsOp::VfpuUnknown {
             opcode: word,
             pc: vaddr,
-        }),
+        })
+    };
+    let unary_imm = |op| {
+        Ok(MipsOp::VfpuUnary {
+            vd: d,
+            vs: s,
+            op,
+            size: sz,
+            imm: imm5,
+        })
+    };
+
+    match idx {
+        0 => decode_vfpu4_unary(word, d, s, sz, vaddr),
+        1 => decode_vfpu7(word, d, s, sz, vaddr),
+        2 => decode_vfpu9(word, d, s, sz, vaddr),
+        3 => unary_imm(VfpuUnaryOp::Vcst),
+        16 => unary_imm(VfpuUnaryOp::Vf2in),
+        17 => unary_imm(VfpuUnaryOp::Vf2iz),
+        18 => unary_imm(VfpuUnaryOp::Vf2iu),
+        19 => unary_imm(VfpuUnaryOp::Vf2id),
+        20 => unary_imm(VfpuUnaryOp::Vi2f),
+        21 => {
+            // vcmov: pack imm3 = (word>>16)&7 with tf = (word>>19)&1
+            // into a single byte (tf in bit 3) so the runtime can honor
+            // the true/false sense exactly like PPSSPP Int_Vcmov.
+            let imm3 = ((word >> 16) & 7) as u8;
+            let tf = ((word >> 19) & 1) as u8;
+            Ok(MipsOp::VfpuUnary {
+                vd: d,
+                vs: s,
+                op: VfpuUnaryOp::Cmov0,
+                size: sz,
+                imm: imm3 | (tf << 3),
+            })
+        }
+        24..=31 => unary_imm(VfpuUnaryOp::Wbn),
+        _ => unknown(),
     }
 }
 
-/// VFPU4 type0: vmov, vabs, vneg, vidt, vsat0, vsat1, vzero, vone,
-///               vrcp, vrsq, vsin, vcos, vexp2, vlog2, vsqrt, vasin,
-///               vnrcp, vnsin, vrexp2
+/// VFPU4 idx 0 — single-vector unary (PPSSPP `tableVFPU4`, sub = bits 20:16).
 ///
-/// PPSSPP tableVFPU4 dispatches on bits 20:16 (5 bits, 32 entries).
 /// Indices 0-7 are move/init ops; 16-28 are trig/math ops.
-fn decode_vfpu4_type0(
+fn decode_vfpu4_unary(
     word: u32,
     d: u8,
     s: u8,
@@ -387,48 +431,9 @@ fn decode_vfpu4_type0(
     })
 }
 
-/// VFPU4 type1: vrcp, vrsq, vsin, vcos, vexp2, vlog2, vsqrt, vasin,
-///              vnrcp, vnsin, vrexp2
-fn decode_vfpu4_type1(
-    word: u32,
-    d: u8,
-    s: u8,
-    sz: u8,
-    vaddr: u32,
-) -> Result<MipsOp, DecodeError> {
-    let sub = (word >> 16) & 0x1F;
-    let op = match sub {
-        0 => VfpuUnaryOp::Rcp,
-        1 => VfpuUnaryOp::Rsq,
-        2 => VfpuUnaryOp::Sin,
-        3 => VfpuUnaryOp::Cos,
-        4 => VfpuUnaryOp::Exp2,
-        5 => VfpuUnaryOp::Log2,
-        6 => VfpuUnaryOp::Sqrt,
-        7 => VfpuUnaryOp::Asin,
-        16 => VfpuUnaryOp::Nrcp,
-        17 => VfpuUnaryOp::Nsin,
-        18 => VfpuUnaryOp::Rexp2,
-        _ => {
-            return Ok(MipsOp::VfpuUnknown {
-                opcode: word,
-                pc: vaddr,
-            });
-        }
-    };
-    Ok(MipsOp::VfpuUnary {
-        vd: d,
-        vs: s,
-        op,
-        size: sz,
-        imm: 0,
-    })
-}
-
-/// VFPU4 type2: vrnds, vrndi, vrndf1, vrndf2, vf2h, vh2f,
-///              vsbz, vlgb, vuc2i, vc2i, vus2i, vs2i,
-///              vi2uc, vi2c, vi2us, vi2s
-fn decode_vfpu4_type2(
+/// VFPU7 (idx 1) — vrnd*, half-float and packed integer conversions
+/// (PPSSPP `tableVFPU7`, sub = bits 20:16).
+fn decode_vfpu7(
     word: u32,
     d: u8,
     s: u8,
@@ -468,9 +473,9 @@ fn decode_vfpu4_type2(
     })
 }
 
-/// VFPU4 type3: vsrt1, vsrt2, vsrt3, vsrt4, vbfy1, vbfy2,
-///              vocp/vsocp, vfad, vavg
-fn decode_vfpu4_type3(
+/// VFPU9 (idx 2) — vsrt*, vbfy*, vocp/vsocp, vfad, vavg
+/// (PPSSPP `tableVFPU9`, sub = bits 20:16).
+fn decode_vfpu9(
     word: u32,
     d: u8,
     s: u8,
@@ -483,11 +488,14 @@ fn decode_vfpu4_type3(
         1 => VfpuUnaryOp::Vsrt2,
         2 => VfpuUnaryOp::Vbfy1,
         3 => VfpuUnaryOp::Vbfy2,
-        4 => VfpuUnaryOp::Vsocp,
+        // 4 => vocp (1-x, same size) is NOT modelled and must NOT be
+        // aliased to vsocp (which doubles the vector) -- emit a stub.
+        5 => VfpuUnaryOp::Vsocp,
         6 => VfpuUnaryOp::Vfad,
         7 => VfpuUnaryOp::Vavg,
         8 => VfpuUnaryOp::Vsrt3,
         9 => VfpuUnaryOp::Vsrt4,
+        // 16/17 vmfvc/vmtvc, 24-26 vt4444/vt5551/vt5650 not yet modelled
         _ => {
             return Ok(MipsOp::VfpuUnknown {
                 opcode: word,
@@ -502,124 +510,6 @@ fn decode_vfpu4_type3(
         size: sz,
         imm: 0,
     })
-}
-
-/// VFPU4 type4: vcmov0, vcmov1 (conditional move)
-fn decode_vfpu4_type4(
-    word: u32,
-    d: u8,
-    s: u8,
-    sz: u8,
-    vaddr: u32,
-) -> Result<MipsOp, DecodeError> {
-    // bits 22:21 select cmov variant
-    let sub21 = (word >> 21) & 3;
-    let cc = (word >> 16) & 0x1F;
-    let op = match sub21 {
-        0 => VfpuUnaryOp::Cmov0,
-        1 => VfpuUnaryOp::Cmov1,
-        _ => {
-            return Ok(MipsOp::VfpuUnknown {
-                opcode: word,
-                pc: vaddr,
-            });
-        }
-    };
-    Ok(MipsOp::VfpuUnary {
-        vd: d,
-        vs: s,
-        op,
-        size: sz,
-        imm: cc as u8,
-    })
-}
-
-/// VFPU4 type5: vf2in, vf2iz, vf2iu, vf2id, vi2f
-fn decode_vfpu4_type5(
-    word: u32,
-    d: u8,
-    s: u8,
-    sz: u8,
-    vaddr: u32,
-) -> Result<MipsOp, DecodeError> {
-    let sub21 = (word >> 21) & 3;
-    let imm_val = ((word >> 16) & 0x1F) as u8;
-    let op = match sub21 {
-        0 => VfpuUnaryOp::Vf2in,
-        1 => VfpuUnaryOp::Vf2iz,
-        2 => VfpuUnaryOp::Vf2iu,
-        3 => VfpuUnaryOp::Vf2id,
-        _ => {
-            return Ok(MipsOp::VfpuUnknown {
-                opcode: word,
-                pc: vaddr,
-            });
-        }
-    };
-    Ok(MipsOp::VfpuUnary {
-        vd: d,
-        vs: s,
-        op,
-        size: sz,
-        imm: imm_val,
-    })
-}
-
-/// VFPU4 type6: vi2f, vwbn
-fn decode_vfpu4_type6(
-    word: u32,
-    d: u8,
-    s: u8,
-    sz: u8,
-    vaddr: u32,
-) -> Result<MipsOp, DecodeError> {
-    let sub21 = (word >> 21) & 3;
-    let imm_val = ((word >> 16) & 0x1F) as u8;
-    match sub21 {
-        0 => Ok(MipsOp::VfpuUnary {
-            vd: d,
-            vs: s,
-            op: VfpuUnaryOp::Vi2f,
-            size: sz,
-            imm: imm_val,
-        }),
-        1 | 3 => Ok(MipsOp::VfpuUnary {
-            vd: d,
-            vs: s,
-            op: VfpuUnaryOp::Wbn,
-            size: sz,
-            imm: imm_val,
-        }),
-        _ => Ok(MipsOp::VfpuUnknown {
-            opcode: word,
-            pc: vaddr,
-        }),
-    }
-}
-
-/// VFPU4 type7: vcst (constant load)
-fn decode_vfpu4_type7(
-    word: u32,
-    d: u8,
-    s: u8,
-    sz: u8,
-    vaddr: u32,
-) -> Result<MipsOp, DecodeError> {
-    let sub21 = (word >> 21) & 3;
-    let imm_val = ((word >> 16) & 0x1F) as u8;
-    match sub21 {
-        0 => Ok(MipsOp::VfpuUnary {
-            vd: d,
-            vs: s,
-            op: VfpuUnaryOp::Vcst,
-            size: sz,
-            imm: imm_val,
-        }),
-        _ => Ok(MipsOp::VfpuUnknown {
-            opcode: word,
-            pc: vaddr,
-        }),
-    }
 }
 
 // -------------------------------------------------------------------------
@@ -1291,6 +1181,119 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // VFPU4Jump 5-bit dispatch regression tests (issue #27 view-matrix fix).
+    //
+    // The old 3-bit `bits[25:23]` dispatch collapsed VFPU4Jump idx 0-3 and
+    // mis-split idx 16-31, so vcmov/vf2i*/vi2f/vcst/vsrt/vbfy decoded to the
+    // wrong op. These pin the real Patapon sceGumLookAt words.
+    // ---------------------------------------------------------------------
+
+    fn unary_op(word: u32, pc: u32) -> VfpuUnaryOp {
+        match decode_vfpu4(word, pc).unwrap() {
+            MipsOp::VfpuUnary { op, .. } => op,
+            other => panic!("0x{word:08X}: expected VfpuUnary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vfpu4_vcmov_not_vf2iz() {
+        // 0xD2A06808 @ 0x08857E94 — the LookAt safe-normalize guard.
+        // VFPU4Jump idx = bits[25:21] = 21 = vcmov (NOT vf2iz, which is
+        // idx 17). The old decoder produced vf2iz here, unconditionally
+        // re-zeroing the rsqrt scale and collapsing the view matrix.
+        match decode_vfpu4(0xD2A06808, 0x08857E94).unwrap() {
+            MipsOp::VfpuUnary { op, vd, vs, imm, .. } => {
+                assert_eq!(op, VfpuUnaryOp::Cmov0, "must be vcmov");
+                assert_eq!(vd, 0x08);
+                assert_eq!(vs, 0x68);
+                // imm packs imm3=(op>>16)&7=0 and tf=(op>>19)&1=0.
+                assert_eq!(imm, 0, "imm3=0, tf=0");
+            }
+            other => panic!("expected vcmov, got {other:?}"),
+        }
+        // Second LookAt cmov: 0xD2A16828 @ 0x08857EBC -> vd=0x28, imm3=1.
+        match decode_vfpu4(0xD2A16828, 0x08857EBC).unwrap() {
+            MipsOp::VfpuUnary { op, vd, vs, imm, .. } => {
+                assert_eq!(op, VfpuUnaryOp::Cmov0);
+                assert_eq!(vd, 0x28);
+                assert_eq!(vs, 0x68);
+                assert_eq!(imm, 1, "imm3=1, tf=0");
+            }
+            other => panic!("expected vcmov, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vfpu4_vf2i_family() {
+        // Real Patapon words: idx 16/17/18/19 = vf2in/vf2iz/vf2iu/vf2id.
+        assert_eq!(unary_op(0xD2000080, 0x08853F40), VfpuUnaryOp::Vf2in);
+        assert_eq!(unary_op(0xD2378080, 0x08833680), VfpuUnaryOp::Vf2iz);
+        assert_eq!(unary_op(0xD2400080, 0x08853F60), VfpuUnaryOp::Vf2iu);
+        assert_eq!(unary_op(0xD2600080, 0x08853F00), VfpuUnaryOp::Vf2id);
+    }
+
+    #[test]
+    fn test_vfpu4_vi2f_not_vf2in() {
+        // 0xD29F8080 @ 0x088339C4 — idx 20 = vi2f (old decoder: vf2in).
+        match decode_vfpu4(0xD29F8080, 0x088339C4).unwrap() {
+            MipsOp::VfpuUnary { op, imm, .. } => {
+                assert_eq!(op, VfpuUnaryOp::Vi2f);
+                // imm5 = bits[20:16] = 0x1F (the int->float scale).
+                assert_eq!(imm, 0x1F);
+            }
+            other => panic!("expected vi2f, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vfpu4_vcst_not_vsat1() {
+        // 0xD0650001 @ 0x088551C4 — idx 3 = vcst (old decoder: vsat1).
+        match decode_vfpu4(0xD0650001, 0x088551C4).unwrap() {
+            MipsOp::VfpuUnary { op, imm, .. } => {
+                assert_eq!(op, VfpuUnaryOp::Vcst);
+                // imm5 = bits[20:16] = constant index 5.
+                assert_eq!(imm, 5);
+            }
+            other => panic!("expected vcst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vfpu4_vfpu9_group() {
+        // idx 2 = VFPU9 sub-table on bits[20:16].
+        // 0xD0468000 @ 0x088548E4 sub=6 -> vfad; 0xD0478000 sub=7 -> vavg;
+        // 0xD0428080 @ 0x08857D64 sub=2 -> vbfy1.
+        assert_eq!(unary_op(0xD0468000, 0x088548E4), VfpuUnaryOp::Vfad);
+        assert_eq!(unary_op(0xD0478000, 0x08854908), VfpuUnaryOp::Vavg);
+        assert_eq!(unary_op(0xD0428080, 0x08857D64), VfpuUnaryOp::Vbfy1);
+        // vsrt3/vsrt4 (sub 8/9).
+        assert_eq!(unary_op(0xD0488181, 0x0885681C), VfpuUnaryOp::Vsrt3);
+        assert_eq!(unary_op(0xD0498081, 0x08856814), VfpuUnaryOp::Vsrt4);
+    }
+
+    #[test]
+    fn test_vfpu4_vrsq_still_correct() {
+        // Regression guard: idx 0 unary path unchanged.
+        // 0xD0110808 -> vrsq (the rsqrt in the LookAt normalize).
+        assert_eq!(unary_op(0xD0110808, 0x08857E90), VfpuUnaryOp::Rsq);
+        // vrcp (sub 16) and vzero (sub 6).
+        assert_eq!(unary_op(0xD0102020, 0x08857CBC), VfpuUnaryOp::Rcp);
+        assert_eq!(unary_op(0xD0060068, 0x08857E88), VfpuUnaryOp::Vzero);
+    }
+
+    #[test]
+    fn test_vfpu4_vocp_not_aliased_to_vsocp() {
+        // idx 2 sub 4 = vocp (1-x, same size). We do not model vocp and
+        // must NOT alias it to vsocp (which doubles the vector). It must
+        // decode to VfpuUnknown rather than silently wrong math.
+        // 0xD0442303 @ 0x088338FC: idx=2, sub=4.
+        match decode_vfpu4(0xD0442303, 0x088338FC).unwrap() {
+            MipsOp::VfpuUnknown { .. } => {}
+            other => panic!("vocp must be VfpuUnknown, got {other:?}"),
         }
     }
 }
