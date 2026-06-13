@@ -712,44 +712,103 @@ fn enhance_function_discovery(
     }
 }
 
+/// Sorted `(start, end)` intervals of every function (`end = start + size`),
+/// for owning-function lookup. Shared by the force and cross-function mid-entry
+/// passes so both resolve owners identically.
+fn sorted_function_intervals(analysis: &AnalysisJson) -> Vec<(u32, u32)> {
+    let mut intervals: Vec<(u32, u32)> = analysis
+        .functions
+        .iter()
+        .filter_map(|f| {
+            let start = parse_hex_u32(&f.address)?;
+            Some((start, start.checked_add(f.size as u32)?))
+        })
+        .collect();
+    intervals.sort_by_key(|&(s, _)| s);
+    intervals
+}
+
+/// Start of the function strictly containing `addr` (`start < addr < end`), or
+/// `None` if `addr` is a function start boundary or unowned. `intervals` must be
+/// sorted by start (see `sorted_function_intervals`).
+fn owning_function_start(intervals: &[(u32, u32)], addr: u32) -> Option<u32> {
+    let idx = intervals.partition_point(|&(s, _)| s <= addr);
+    if idx > 0 {
+        let (s, e) = intervals[idx - 1];
+        if addr > s && addr < e {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Resolve the real parent for a force-mid-entry, applying the issue #65 guard.
+/// Returns the owning function's start (the parent the emitter must dispatch
+/// from), or `None` to skip. `declared_parent` is the (possibly stale) parent
+/// from `game.toml`; a mismatch is logged and the real owner used instead.
+fn resolve_force_mid_parent(
+    intervals: &[(u32, u32)],
+    entry: u32,
+    declared_parent: u32,
+) -> Option<u32> {
+    let Some(owner) = owning_function_start(intervals, entry) else {
+        tracing::info!(
+            "force_mid_entries: 0x{:08X} is not strictly inside any function \
+             (a standalone entry reached via RECOMP_LOOKUP, or unowned); \
+             skipping cross-function mid-entry",
+            entry,
+        );
+        return None;
+    };
+    if owner != declared_parent {
+        tracing::warn!(
+            "force_mid_entries: 0x{:08X} declared parent 0x{:08X} but actually \
+             owned by 0x{:08X}; re-pointing to its real owner (stale game.toml \
+             parent vs current export)",
+            entry,
+            declared_parent,
+            owner,
+        );
+    }
+    Some(owner)
+}
+
 /// Force-inject mid-entry addresses that Ghidra's analysis missed but the
 /// runtime observes as repeated `LOOKUP_MISS` hits. Each pair is
 /// `(mid_entry_addr, parent_addr)`, curated per game in the --config
 /// manifest (`[recompile] force_mid_entries`, issue #46 — see
-/// games/patapon/game.toml for the rationale on Patapon's pairs). The parent
-/// must already exist in `analysis.functions`; otherwise the entry is
-/// skipped with a warning. Existing `mid_entries` with the same address are
-/// not duplicated.
+/// games/patapon/game.toml for the rationale on Patapon's pairs). Existing
+/// `mid_entries` with the same address are not duplicated.
+///
+/// Function-entry collision guard (issue #65). A force-mid-entry only emits a
+/// valid (in-function) `goto` if its `entry` address lands STRICTLY inside the
+/// body of the function it is dispatched from. The emitter places the
+/// `L_<entry>:` label wherever the address physically falls and the prologue
+/// `case … goto L_<entry>` in the *declared parent* — so if those two functions
+/// differ, the result is a cross-function `goto` (`error: use of undeclared
+/// label`, CLAUDE.md #9). Enhanced discovery (run just before this pass) can
+/// turn a `game.toml` parent that was authored for an older export into a stale
+/// reference two ways, both rejected by `resolve_force_mid_parent` resolving the
+/// entry's *actual* owning function instead of trusting the declared parent.
 fn inject_force_mid_entries(analysis: &mut AnalysisJson, force_mid_entries: &[(u32, u32)]) {
     let existing: HashSet<u32> = analysis
         .mid_entries
         .iter()
         .filter_map(|me| parse_hex_u32(&me.addr))
         .collect();
-
-    let parents: HashSet<u32> = analysis
-        .functions
-        .iter()
-        .filter_map(|f| parse_hex_u32(&f.address))
-        .collect();
+    let intervals = sorted_function_intervals(analysis);
 
     let mut injected = 0usize;
-    for &(entry, parent) in force_mid_entries {
+    for &(entry, declared_parent) in force_mid_entries {
         if existing.contains(&entry) {
             continue;
         }
-        if !parents.contains(&parent) {
-            tracing::warn!(
-                "force_mid_entries: parent 0x{:08X} not in functions list; \
-                 skipping mid-entry 0x{:08X}",
-                parent,
-                entry,
-            );
+        let Some(owner) = resolve_force_mid_parent(&intervals, entry, declared_parent) else {
             continue;
-        }
+        };
         analysis.mid_entries.push(JsonMidEntry {
             addr: format!("0x{:08X}", entry),
-            parent_addr: format!("0x{:08X}", parent),
+            parent_addr: format!("0x{:08X}", owner),
         });
         injected += 1;
     }
@@ -812,17 +871,8 @@ fn inject_cross_function_mid_jumps(
     data_xrefs: &[(u32, u32)],
 ) {
     // Sorted (start, end) intervals of all real functions, for owning-function
-    // lookup. end = start + size.
-    let mut intervals: Vec<(u32, u32)> = analysis
-        .functions
-        .iter()
-        .filter_map(|f| {
-            let start = parse_hex_u32(&f.address)?;
-            let end = start.checked_add(f.size as u32)?;
-            Some((start, end))
-        })
-        .collect();
-    intervals.sort_by_key(|&(s, _)| s);
+    // lookup (see `owning_function_start`).
+    let intervals = sorted_function_intervals(analysis);
 
     // Addresses already covered: function entries + existing mid-entries.
     let entries: HashSet<u32> = analysis
@@ -835,19 +885,6 @@ fn inject_cross_function_mid_jumps(
         .iter()
         .filter_map(|me| parse_hex_u32(&me.addr))
         .collect();
-
-    // Find the function strictly containing `addr` (start < addr < end). Returns
-    // (start, end) of the owner, or None if addr is a start boundary / unowned.
-    let owner_of = |addr: u32| -> Option<(u32, u32)> {
-        let idx = intervals.partition_point(|&(s, _)| s <= addr);
-        if idx > 0 {
-            let (s, e) = intervals[idx - 1];
-            if addr > s && addr < e {
-                return Some((s, e));
-            }
-        }
-        None
-    };
 
     // Collect (mid_addr, parent_addr) discoveries; dedup via known_mids.
     let mut new_mids: Vec<(u32, u32)> = Vec::new();
@@ -872,7 +909,7 @@ fn inject_cross_function_mid_jumps(
                 continue;
             }
             // Must land strictly inside another function to be a valid mid-entry.
-            let Some((owner_start, _owner_end)) = owner_of(target) else { continue };
+            let Some(owner_start) = owning_function_start(&intervals, target) else { continue };
             if known_mids.insert(target) {
                 new_mids.push((target, owner_start));
             }

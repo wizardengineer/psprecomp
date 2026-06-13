@@ -46,6 +46,18 @@ force_entries_cross_mid = [
 ]
 
 # Mid-entries Ghidra missed, observed as repeated LOOKUP_MISS in the runtime.
+#
+# These pairs were authored for the AUGMENTED (grafted) baseline, where the
+# coalesce pass makes FUN_08827E7C the single owner of EA0/EB0/F44/F9C. On that
+# baseline (the documented Patapon path, 14104/2022/283) the parents below are
+# correct and inject verbatim. On a FRESH analyze (no vtable_miss graft),
+# enhanced discovery instead promotes EA0/EB0 to standalone functions and moves
+# the F44/F9C bodies into FUN_08827EB0 — so these parents go stale and a naive
+# inject would emit cross-function gotos. The issue #65 collision guard in
+# inject_force_mid_entries (recompile.rs) resolves each entry's real owner: it
+# SKIPS EA0/EB0 (now standalone, reached via RECOMP_LOOKUP) and RE-POINTS F44/F9C
+# to FUN_08827EB0. The entries are therefore left here (the guard handles both
+# layouts); they are load-bearing on the augmented baseline.
 
 [[recompile.force_mid_entries]]
 # Mid-entry inside FUN_08827E7C, tail-called from FUN_08827F7C via

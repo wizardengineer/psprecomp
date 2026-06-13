@@ -16,6 +16,7 @@ output/
 # Analysis artifacts (large generated JSON, not source)
 analysis.json
 analysis.ghidra_raw.json
+analysis.ghidra_raw.meta.json
 discovered_entries.json
 
 # Binary files

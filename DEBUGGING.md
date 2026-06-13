@@ -463,15 +463,27 @@ PSPRECOMP_CROSS_MID=1 cargo run --release -- recompile analysis.json \
 
 (The manifest `force_entries` mechanism (#47 Phase 4) can carry the 524 vtable_miss
 addresses as curated per-game data, but the grafted baseline remains the documented
-Patapon path until issue #54 — fresh-analyze output currently fails to compile on an
-emitter goto-label bug — is fixed.)
+Patapon path. The fresh-analyze build break (issue #54/#65) is **fixed** — see below.)
 
-**The graft is mandatory, not just preferred:** recompiling the *fresh* (non-grafted)
-Patapon analysis currently emits code that does not compile — `FUN_08827E7C` in
-batch_0020.cpp contains `goto` statements to mid-entry labels (`L_08827F44` et al.) that
-are absent from the function body. Pre-existing emitter gap (mid-entry/coalesce layer,
-untouched by #40/#47 P1-P3), tracked as a GitHub issue: the emitter should drop dispatch
-cases whose labels are missing from the parent body, or hard-error at emit time.
+**The graft is mandatory for boot correctness, not for the build.** The build-blocking
+half (issue #54/#65) is **resolved** by the `inject_force_mid_entries` function-entry
+collision guard (`crates/psp-cli/src/recompile.rs`, `fix/baseline-stabilize`): on the
+*fresh* export, enhanced discovery promotes `0x08827EA0/EB0` to standalone functions and
+moves the `0x08827F44/F9C` bodies into `FUN_08827EB0`, so the old `game.toml`
+force-mid-entries (authored for the coalesced augmented layout where `FUN_08827E7C` owns
+them all) would emit cross-function `goto`s (`error: use of undeclared label`, CLAUDE.md
+#9). The guard resolves each force-mid-entry's *actual* owning function: it skips entries
+that are themselves a discovered standalone function (EA0/EB0 — redundant, reached via
+`RECOMP_LOOKUP`) and re-points entries whose declared parent is stale to their real owner
+(F44/F9C → `FUN_08827EB0`). On the augmented baseline the guard is a **no-op** (the
+declared parents already match the coalesced owner), so `14104/2022/283` is unchanged.
+
+The fresh path now **builds green** (verified `fix/baseline-stabilize`). It still **boots
+short** of the baseline because the 524 vtable_miss functions + their 13 dispatch roots
+(`0x08858D0C` et al.) are absent — without them boot stalls in a `sceIoOpenAsync`
+fd-table loop and never reaches GE geometry (`real_nonsprite` stays 0). So the graft above
+remains mandatory to reach the `~15618 real_nonsprite` baseline; the guard just removes the
+compile barrier that previously blocked even *testing* the fresh path.
 
 
 ## #46/#47 P4 — per-game manifest + game module (PSPRECOMP_GAME)
