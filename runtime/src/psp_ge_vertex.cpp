@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 // ---- Matrix helpers (PSP column-major layout) ----
 //
@@ -405,6 +406,112 @@ static bool ge_proj_matrix_degenerate(const GeState& state) {
     return bad;
 }
 
+/// Compose model->world->view->proj for one position and return its NDC
+/// (post perspective-divide). Mirrors the real transform path below.
+static void ge_compose_mvp_ndc(
+    const GeState& state, const float pos[3], float ndc[3]
+) {
+    float wpos[3], vpos[3], clip[4];
+    vec3_by_matrix43(state.world_matrix, pos, wpos);
+    vec3_by_matrix43(state.view_matrix, wpos, vpos);
+    vec3_by_matrix44(state.proj_matrix, vpos, clip);
+    if (std::fabs(clip[3]) > 1e-6f) {
+        ndc[0] = clip[0] / clip[3];
+        ndc[1] = clip[1] / clip[3];
+        ndc[2] = clip[2] / clip[3];
+    } else {
+        ndc[0] = clip[0];
+        ndc[1] = clip[1];
+        ndc[2] = clip[2];
+    }
+}
+
+/// Generic collapsed-MVP detector. The real transform inputs (guest-uploaded
+/// matrices) are still wrong (FPU/VFPU dataflow family, open issue): they
+/// now arrive non-zero but numerically broken, so neither the all-zero nor
+/// the diagonal-degenerate gate above fires, yet the composed MVP crushes a
+/// whole primitive onto a few-pixel sliver at screen center -- a black screen.
+///
+/// Detection is GENERIC (no game constants). It transforms the prim's
+/// vertices through the real MVP and compares the post-transform NDC footprint
+/// against the pre-transform model-space footprint, using two independent
+/// signals that must BOTH hold so legitimately-small geometry is never
+/// mis-flagged:
+///
+///   1. ABSOLUTE: the prim's NDC footprint is below a few-pixel "effectively
+///      invisible" ceiling (NDC_INVISIBLE_MAX). A correctly-rendered visible
+///      element is larger than this.
+///   2. RELATIVE: the shrink ratio (NDC extent per unit of model spread) is
+///      far below any plausible projection (RATIO_MIN). A genuinely-small but
+///      correctly-transformed element keeps a normal ratio (its small NDC
+///      matches its small model), so it fails this and is left alone; only a
+///      meaningfully-spread prim that the MVP crushes to a sliver fails both.
+///
+/// A non-finite composed NDC always counts as collapsed. Measured values:
+/// broken Patapon title prims read model spread ~28 -> NDC extent ~0.02
+/// (ratio ~0.0007); a healthy 1:1 ortho maps 480 model units -> NDC 2.0
+/// (ratio ~0.0042) and never trips the absolute ceiling.
+static bool ge_mvp_collapses(
+    const GeState& state, const std::vector<DecodedVertex>& verts
+) {
+    if (verts.size() < 2) return false;
+
+    // ~8 px on a 480-wide target (8 * 2/480). A real visible element spans
+    // more; a crushed prim is far below this.
+    constexpr float NDC_INVISIBLE_MAX = 8.0f * 2.0f / 480.0f;  // ~0.0333
+    // Minimum plausible NDC-per-model-unit. A healthy 1:1 ortho is ~0.0042;
+    // the broken title is ~0.0007. 0.002 sits ~3x under healthy and ~3x over
+    // broken -- a wide guard band either way.
+    constexpr float RATIO_MIN = 0.002f;
+    // Below this model spread the input is genuinely tiny, so a small NDC is
+    // correct (the ratio test would be noisy on a near-zero denominator).
+    constexpr float MODEL_SPREAD_MIN = 4.0f;
+
+    float ndc_min[2] = {1e30f, 1e30f};
+    float ndc_max[2] = {-1e30f, -1e30f};
+    float mdl_min[3] = {1e30f, 1e30f, 1e30f};
+    float mdl_max[3] = {-1e30f, -1e30f, -1e30f};
+    bool non_finite = false;
+
+    for (const auto& v : verts) {
+        float ndc[3];
+        ge_compose_mvp_ndc(state, v.pos, ndc);
+        for (int k = 0; k < 2; k++) {
+            if (!std::isfinite(ndc[k])) { non_finite = true; continue; }
+            if (ndc[k] < ndc_min[k]) ndc_min[k] = ndc[k];
+            if (ndc[k] > ndc_max[k]) ndc_max[k] = ndc[k];
+        }
+        for (int k = 0; k < 3; k++) {
+            if (v.pos[k] < mdl_min[k]) mdl_min[k] = v.pos[k];
+            if (v.pos[k] > mdl_max[k]) mdl_max[k] = v.pos[k];
+        }
+    }
+
+    float mdl_spread = 0.0f;
+    for (int k = 0; k < 3; k++)
+        mdl_spread = std::max(mdl_spread, mdl_max[k] - mdl_min[k]);
+    float ndc_extent = std::max(ndc_max[0] - ndc_min[0],
+                                ndc_max[1] - ndc_min[1]);
+    float ratio = (mdl_spread > 1e-6f) ? (ndc_extent / mdl_spread) : 1.0f;
+
+    bool collapsed =
+        non_finite
+        || (mdl_spread > MODEL_SPREAD_MIN
+            && ndc_extent < NDC_INVISIBLE_MAX
+            && ratio < RATIO_MIN);
+    if (collapsed) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                "[GE] composed MVP collapses prim (model spread %.3f -> "
+                "NDC extent %.5f, ratio %.5f) -- NDC-direct fallback "
+                "engaged\n", mdl_spread, ndc_extent, ratio);
+        }
+    }
+    return collapsed;
+}
+
 // Game-module degenerate-matrix fallback slot (#47 P5 seam).
 static GeDegenerateFallbackFn g_degenerate_fallback = nullptr;
 
@@ -466,9 +573,16 @@ void ge_transform_vertices(
         // all-zero view ALSO routes to the degenerate fallback.
         // The full real path engages automatically once the guest
         // uploads a non-zero view matrix.
+        // The all-zero / diagonal-degenerate gates catch the matrices that
+        // are *obviously* broken. ge_mvp_collapses additionally catches the
+        // subtler case (#27 family): matrices that arrive non-zero and
+        // non-singular but compose into an MVP that maps the whole prim onto
+        // a sub-pixel cluster -- a silent black screen the static gates miss.
         bool view_zero = ge_view_matrix_all_zero(state);
         bool proj_bad = ge_proj_matrix_degenerate(state);
-        bool ndc_direct = view_zero || proj_bad;
+        bool mvp_collapsed =
+            !view_zero && !proj_bad && ge_mvp_collapses(state, verts);
+        bool ndc_direct = view_zero || proj_bad || mvp_collapsed;
 
         for (auto& v : verts) {
             float wpos[3], vpos[3];

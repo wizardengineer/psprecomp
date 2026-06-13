@@ -79,8 +79,24 @@ PSPRECOMP_CROSS_MID=1 PSPRECOMP_CLEANROOM=1 timeout 120 \
 # Gates: exit 124; sentinel-only LOOKUP_MISS; 0 "bus error"/"marking dead";
 # [GE_GEOM_HEARTBEAT] monotonic; real_nonsprite in expected band (13.8k-15.7k @120s;
 #   observed across sessions — boot nondeterminism moves it within this band);
-# "proj matrix degenerate" ABSENT; "view matrix all-zero" exactly once.
-# DELETE /tmp/run.log after grepping.
+# "proj matrix degenerate" ABSENT; exactly ONE degenerate-matrix fallback notice
+#   ("view matrix all-zero" OR "composed MVP collapses prim", title-tuned ortho
+#   fallback — see below). DELETE /tmp/run.log after grepping.
+
+# VISIBLE-OUTPUT gate (mandatory — the prim-count gate above CANNOT see a black
+# screen: a broken transform can submit thousands of real_nonsprite prims that
+# all collapse to a sub-pixel sliver, leaving the frame black while
+# real_nonsprite stays in band. This regressed dev once — #27 turned the Patapon
+# title black with real_nonsprite untouched; see
+# .planning/research/patapon-visible-output.md). After a verification run, grab a
+# frame at the title timepoint and assert it is actually VISIBLE:
+PSPRECOMP_DISC0=./disc0 ./runtime/build/psprecomp_runtime > /tmp/run.log 2>&1 &
+sleep 22 && printf 'S /tmp/title.tga\n' | nc -w 15 127.0.0.1 9999 && kill %1
+python3 runtime/tools/visible_output_gate.py /tmp/title.tga
+# PASS == distinct colors >= 8 AND non-black >= 1% (defaults). Master/oracle
+# baseline for the Patapon title is ~100 distinct, ~14% non-black (~13k white px
+# = the "PATAPON" logo). A black grab (1 color, 0%) FAILS the gate.
+# DELETE /tmp/run.log and /tmp/title.tga after.
 ```
 
 **Stale-output trap:** `output/` is gitignored. After ANY emitter change you MUST
