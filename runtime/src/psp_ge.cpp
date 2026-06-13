@@ -99,6 +99,8 @@ void ge_init() {
     g_ge_state.viewport_x_scale = 240.0f;
     g_ge_state.viewport_y_scale = -136.0f;
     g_ge_state.viewport_z_scale = 32767.5f;
+    g_ge_state.min_z = 0;          // depth range default [0, 65535]
+    g_ge_state.max_z = 65535;
     g_ge_state.shade_mode = 1;  // gouraud
     g_ge_state.depth_func = GE_COMP_GEQUAL;
 
@@ -703,7 +705,10 @@ GeListResult ge_process_display_list(
             g_ge_state.scissor2 = data;
             break;
         case GE_CMD_MINZ:
+            g_ge_state.min_z = data & 0xFFFFu;
+            break;
         case GE_CMD_MAXZ:
+            g_ge_state.max_z = data & 0xFFFFu;
             break;
 
         // ---- Depth / Z buffer ----

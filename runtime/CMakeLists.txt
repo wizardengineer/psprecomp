@@ -114,6 +114,7 @@ set(RUNTIME_SOURCES
     src/psp_ge_texture.cpp
     src/psp_ge_shader.cpp
     src/psp_ge_draw.cpp
+    src/psp_ge_viewport.cpp
     src/psp_ge_test.cpp
     src/hle/psp_hle_dispatch.cpp
     src/hle/psp_hle_kernel_thread.cpp
@@ -303,6 +304,26 @@ target_compile_options(test_ge_vertex PRIVATE
 )
 
 add_test(NAME ge_vertex_tests COMMAND test_ge_vertex)
+
+# GE viewport/depth-range mapping unit test (issue #23). Pure math: links
+# psp_ge_viewport.cpp only -- no SDL2/GL/scheduler deps.
+add_executable(test_ge_viewport
+    tests/test_ge_viewport.cpp
+    src/psp_ge_viewport.cpp
+)
+
+target_include_directories(test_ge_viewport PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_options(test_ge_viewport PRIVATE
+    -O2
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+)
+
+add_test(NAME ge_viewport_tests COMMAND test_ge_viewport)
 
 # BND parser unit test target (mirrors test_vfpu convention: no SDL2/GL,
 # links the parser plus psp_memory + system zlib only). The BND layer is
