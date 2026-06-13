@@ -82,6 +82,11 @@ struct recomp_context {
     uint32_t vfpu_ctrl[16]; // VFPU control registers (SPREFIX, TPREFIX, DPREFIX, etc.)
     uint32_t pc;            // Program counter (for debugging/STRICT mode)
     uint32_t entry_point;   // Mid-entry dispatch: 0 = normal entry, nonzero = jump to label
+    // Instruction-budget preemption (#66, design approach (a)). Decremented at
+    // every emitted loop back-edge; when it reaches <= 0 the emitted code calls
+    // sched_preempt(ctx), which reloads it. With PSPRECOMP_PREEMPT unset/0 this
+    // is a dead-effect counter + a no-op call (default-off — Patapon-identical).
+    int32_t preempt_budget;
 };
 // Alias helpers (emitted code uses ctx->r[N], ctx->f[N].fl, etc.)
 // ctx->r[0] is always 0 — enforced by emitter suppression, not runtime check.
@@ -287,6 +292,13 @@ void psp_hle_syscall(uint8_t* rdram, recomp_context* ctx, uint32_t code);
 // PC tracing checkpoint (Phase 06.1 -- runtime provides implementation)
 // No-op when PSPRECOMP_PC_TRACE env var is not set to "1".
 extern void psp_trace_checkpoint(uint32_t addr);
+
+// Instruction-budget preemption point (#66, design approach (a) — runtime
+// provides the implementation in psp_scheduler.cpp). Emitted at loop back-edges
+// as `if (--ctx->preempt_budget <= 0) sched_preempt(ctx);`. DEFAULT-OFF: when
+// the PSPRECOMP_PREEMPT env var is unset/0 this only reloads ctx->preempt_budget
+// and returns (no yield); the real fair-yield path is gated behind the flag.
+extern void sched_preempt(recomp_context* ctx);
 "#
         .to_string()
     }

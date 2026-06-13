@@ -63,8 +63,13 @@ struct recomp_context {{
     uint32_t vfpu_ctrl[16];
     uint32_t pc;
     uint32_t entry_point;
+    int32_t preempt_budget;  // #66 instruction-budget preemption
 }};
 static void psp_trace_checkpoint(uint32_t) {{}}
+// #66: the emitted back-edge preemption point calls sched_preempt. In this
+// standalone harness it is a no-op reload (mirrors the DEFAULT-OFF runtime),
+// so the memset tail still terminates writing exactly N bytes.
+static void sched_preempt(recomp_context* ctx) {{ if (ctx) ctx->preempt_budget = 100000; }}
 static uint64_t g_writes = 0;
 static uint8_t g_mem[0x10000];
 static void mem_b_write(uint32_t addr, uint32_t val) {{
