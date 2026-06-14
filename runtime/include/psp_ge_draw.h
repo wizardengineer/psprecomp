@@ -35,6 +35,19 @@ void ge_draw_begin_list();
 /// Called at end of display list processing.
 void ge_draw_end_list();
 
+/// Bind the GL FBO for the guest framebuffer address fb_addr_raw (FRAMEBUFPTR
+/// or sceDisplaySetFrameBuf), creating it in the generic per-address pool if
+/// needed (issue #59). key==0 keeps the current target. Render (GL) thread.
+void ge_draw_select_target(uint32_t fb_addr_raw);
+
+/// Mark the front buffer dirty (a list was processed) for the liveness net.
+void ge_draw_mark_dirty();
+
+/// Liveness net: if content is dirty and no real page-flip happened within
+/// PSPRECOMP_PRESENT_STALE_MS (default 100ms), present the front buffer once.
+/// MUST be called from the main (GL) thread — wired into psp_event_loop.
+void ge_draw_present_if_stale(uint8_t* rdram);
+
 /// Full draw pipeline for a GE PRIM command:
 /// decode vertices -> transform -> upload VBO -> set GL state -> draw.
 void ge_draw_prim(
