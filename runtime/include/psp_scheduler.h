@@ -87,6 +87,17 @@ struct PspThread {
                                 ///< the token until it re-contends. Guarded by
                                 ///< g_sched_mutex. Unused when PSPRECOMP_PREEMPT
                                 ///< is OFF.
+    uint64_t token_last_ran = 0; ///< [F2-core] Monotonic stamp = the value of
+                                 ///< g_token_grant_seq at the moment this thread
+                                 ///< was last GRANTED the token. Used by
+                                 ///< select_next_runnable as the within-priority
+                                 ///< tiebreak: least-recently-ran (smallest stamp)
+                                 ///< wins, so a just-yielded holder is demoted and
+                                 ///< a freshly-un-parked starved peer is picked
+                                 ///< first. Written/read ONLY on the ON path
+                                 ///< (token_enabled()); guarded by g_sched_mutex.
+                                 ///< Stays 0 forever when PSPRECOMP_PREEMPT is OFF
+                                 ///< (OFF byte-identical).
 };
 
 /// Initialize scheduler — zero all 64 thread slots.

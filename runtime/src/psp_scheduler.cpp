@@ -43,7 +43,28 @@ static bool token_enabled();
 
 /// Within-priority round-robin cursor: index after the last thread that was
 /// granted the token, so equal-priority peers take turns (PPSSPP pop_first).
+/// [F2-core] Retained as the SECONDARY within-priority tiebreak (stable,
+/// deterministic) behind the primary "least-recently-ran" key — see
+/// select_next_runnable. Only updated on the ON path (token_release_to).
 static int g_rr_cursor = 0;
+
+/// [F2-core] Monotonic grant sequence, guarded by g_sched_mutex. Bumped every
+/// time a thread is GRANTED the token (becomes g_token_holder), and the grantee's
+/// PspThread::token_last_ran is set to the new value. select_next_runnable uses
+/// token_last_ran as the within-priority tiebreak (smallest = least-recently-ran
+/// = picked first), so a just-yielded holder is demoted below a starved peer.
+/// ON-only: every write/read is on a path that early-returns at the OFF
+/// token_enabled() gate, so OFF this counter never moves (stays 0) and no thread's
+/// token_last_ran is ever touched — OFF byte-identical.
+static uint64_t g_token_grant_seq = 0;
+
+/// [F2-core] Stamp `t` as just-granted: bump the global grant sequence and record
+/// it on the grantee. Caller holds g_sched_mutex AND must be on the ON path (every
+/// call site is already gated by token_enabled()). Never called OFF.
+static void token_mark_granted(PspThread* t) {
+    g_token_grant_seq++;
+    t->token_last_ran = g_token_grant_seq;
+}
 
 /// [approach (d) perf pass, M5/F1] ON-only diagnostic counters for the token
 /// wait valve. Incremented ONLY inside token_acquire, which returns at its OFF
@@ -76,8 +97,19 @@ static std::atomic<uint64_t> g_valve_nullptr_claims{0};
 static PspThread* select_next_runnable(PspThread* exclude) {
     assert(!(g_token_holder && g_token_holder->token_parked) &&
            "INVARIANT: a token_parked thread is never g_token_holder");
+    // [F2-core] Within-priority tiebreak is "least-recently-ran" (smallest
+    // token_last_ran) so a just-yielded holder is demoted and a starved /
+    // freshly-un-parked peer is preferred — fixing the hand-off routing
+    // starvation. g_rr_cursor remains the SECONDARY tiebreak (stable rotation
+    // among equal-priority peers that share a token_last_ran, e.g. both 0 at
+    // startup), preserving determinism. This whole function is only reachable on
+    // the ON path (every caller — token_release_to, other_runnable_exists,
+    // token_acquire — early-returns at the token_enabled() gate before calling
+    // it), so OFF it is never entered and token_last_ran is never read; the
+    // tiebreak change is OFF-invisible by construction.
     PspThread* best = nullptr;
-    // Scan starting just after the RR cursor so equal-priority peers rotate.
+    // Scan starting just after the RR cursor so equal-priority peers with an
+    // equal token_last_ran still rotate (secondary tiebreak / determinism).
     for (int n = 0; n < MAX_THREADS; n++) {
         int i = (g_rr_cursor + 1 + n) % MAX_THREADS;
         PspThread& t = g_threads[i];
@@ -96,7 +128,20 @@ static PspThread* select_next_runnable(PspThread* exclude) {
         if (t.status != READY && t.status != RUNNING) {
             continue;
         }
-        if (!best || t.priority < best->priority) {
+        if (!best) {
+            best = &t;
+            continue;
+        }
+        // Primary key: highest priority (lowest number) first.
+        if (t.priority < best->priority) {
+            best = &t;
+            continue;
+        }
+        // Within the same priority: least-recently-ran (smallest token_last_ran)
+        // wins. Strict `<` keeps the RR-cursor-ordered first match on ties, so
+        // equal-stamp peers (e.g. startup 0s) still rotate via g_rr_cursor.
+        if (t.priority == best->priority &&
+            t.token_last_ran < best->token_last_ran) {
             best = &t;
         }
     }
@@ -116,6 +161,7 @@ static void token_release_to(PspThread* self) {
         return;  // No runnable peer — keep the token (don't release into void).
     }
     g_token_holder = next;
+    token_mark_granted(next);  // [F2-core] stamp the grantee least-recently-ran
     for (int i = 0; i < MAX_THREADS; i++) {
         if (&g_threads[i] == next) {
             g_rr_cursor = i;
@@ -151,6 +197,7 @@ static void token_acquire(std::unique_lock<std::mutex>& lock, PspThread* self) {
     // First-free fast path: if the token is free, take it directly.
     if (g_token_holder == nullptr) {
         g_token_holder = self;
+        token_mark_granted(self);  // [F2-core] stamp self as just-ran
         return;
     }
     // [M5/F1] Predicated wait — no missed wake. The predicate also accepts a
@@ -175,6 +222,7 @@ static void token_acquire(std::unique_lock<std::mutex>& lock, PspThread* self) {
         }
         if (g_token_holder == nullptr) {  // R2: claim the freed token
             g_token_holder = self;
+            token_mark_granted(self);  // [F2-core] stamp self as just-ran
             ++g_valve_nullptr_claims;
         }
     }
