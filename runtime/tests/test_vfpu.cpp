@@ -657,6 +657,114 @@ static void test_lookat_forward_normalize() {
 }
 
 // ===================================================================
+// Test: vmmul applies the S/D prefix to the FINAL ELEMENT only (#27/#67)
+//
+// PPSSPP Int_Vmmul swizzles S/T only on the final dot (a==b==n-1) and
+// applies the D prefix only to that last element; every earlier element
+// is the raw, unprefixed dot. Pre-fix OUR vmmul applied NO prefix at all,
+// so a live prefix silently vanished. This pins the last-element scope:
+// the three earlier 2x2 elements must stay raw while only d[1][1] reacts.
+//
+// ms = [[1,2],[3,4]], mt = [[10,20],[30,40]] (row b/a, col c).
+// d[a*4+b] = sum_c ms[b*4+c]*mt[a*4+c]:
+//   d00=50  d01(a0,b1)=110  d10(a1,b0)=110  d11=250  (identity prefixes).
+// With SPREFIX = 0x000000 (swizzle every lane <- lane 0, i.e. broadcast
+// the first component) applied ONLY to the final dot, the last row of ms
+// becomes [3,3,3,3]; d11 = 3*30 + 3*40 = 210, and d00/d01/d10 stay raw.
+// ===================================================================
+static void test_vmmul_last_element_prefix() {
+    std::printf("  test_vmmul_last_element_prefix...\n");
+    recomp_context ctx;
+
+    // Layout: matrix element (row r, col c) of mtx m -> flat m*16 + c*4 + r.
+    // read_matrix(reg 0x00) yields ms[b*4+c] = vfpu[b*4 + c] (col==row==0),
+    // so we write ms[b*4+c] / mt[a*4+c] straight into those flat slots.
+    auto setup = [](recomp_context& c) {
+        init_ctx(c);
+        c.vfpu[0 * 4 + 0] = 1.0f;  // ms row0
+        c.vfpu[0 * 4 + 1] = 2.0f;
+        c.vfpu[1 * 4 + 0] = 3.0f;  // ms row1
+        c.vfpu[1 * 4 + 1] = 4.0f;
+        c.vfpu[16 + 0 * 4 + 0] = 10.0f;  // mt row0 (mtx1)
+        c.vfpu[16 + 0 * 4 + 1] = 20.0f;
+        c.vfpu[16 + 1 * 4 + 0] = 30.0f;  // mt row1
+        c.vfpu[16 + 1 * 4 + 1] = 40.0f;
+    };
+
+    // Identity-prefix baseline. vmmul M200, M000, M100 (vd=0x08).
+    setup(ctx);
+    vfpu_vmmul(&ctx, nullptr, 0x08, 0x00, 0x04, 2);
+    ASSERT_APPROX(ctx.vfpu[32 + 0], 50.0f, 1e-4f, "vmmul d00 raw");
+    ASSERT_APPROX(ctx.vfpu[32 + 4], 110.0f, 1e-4f, "vmmul d01 raw");
+    ASSERT_APPROX(ctx.vfpu[33 + 0], 110.0f, 1e-4f, "vmmul d10 raw");
+    ASSERT_APPROX(ctx.vfpu[33 + 4], 250.0f, 1e-4f, "vmmul d11 raw");
+
+    // SPREFIX broadcasts lane 0 -> applies to the final element only.
+    setup(ctx);
+    ctx.vfpu_ctrl[VFPU_CTRL_SPREFIX] = 0x000000u;
+    vfpu_vmmul(&ctx, nullptr, 0x08, 0x00, 0x04, 2);
+    ASSERT_APPROX(ctx.vfpu[32 + 0], 50.0f, 1e-4f,
+                  "vmmul d00 stays raw under S prefix");
+    ASSERT_APPROX(ctx.vfpu[32 + 4], 110.0f, 1e-4f,
+                  "vmmul d01 stays raw under S prefix");
+    ASSERT_APPROX(ctx.vfpu[33 + 0], 110.0f, 1e-4f,
+                  "vmmul d10 stays raw under S prefix");
+    ASSERT_APPROX(ctx.vfpu[33 + 4], 210.0f, 1e-4f,
+                  "vmmul d11 reacts to last-element S prefix");
+}
+
+// ===================================================================
+// Test: vtfm applies the S/T/D prefix to the FINAL ROW only (#27/#67)
+//
+// PPSSPP Int_Vtfm computes rows 0..n-2 from the raw vector and applies
+// the S/T prefixes (and the last-element D) only on the final row. Pre-fix
+// OUR vtfm applied the T prefix to the WHOLE input vector and D to the
+// WHOLE result -- wrong scope. This pins the last-row scope: with a T
+// prefix that negates all lanes, the earlier rows stay raw and only the
+// final row's dot uses the negated vector.
+//
+// 3x3 M = [[1,2,3],[4,5,6],[7,8,9]], v = (1,1,1):
+//   identity   -> d = (6, 15, 24)
+//   T-negate   -> d = (6, 15, -24)   (only the last row flips sign)
+// ===================================================================
+static void test_vtfm_last_row_prefix() {
+    std::printf("  test_vtfm_last_row_prefix...\n");
+    recomp_context ctx;
+
+    auto setup = [](recomp_context& c) {
+        init_ctx(c);
+        // read_matrix(reg 0x00) -> ms[row*4+col] = vfpu[row*4+col].
+        c.vfpu[0 * 4 + 0] = 1.0f; c.vfpu[0 * 4 + 1] = 2.0f;
+        c.vfpu[0 * 4 + 2] = 3.0f;
+        c.vfpu[1 * 4 + 0] = 4.0f; c.vfpu[1 * 4 + 1] = 5.0f;
+        c.vfpu[1 * 4 + 2] = 6.0f;
+        c.vfpu[2 * 4 + 0] = 7.0f; c.vfpu[2 * 4 + 1] = 8.0f;
+        c.vfpu[2 * 4 + 2] = 9.0f;
+        // v = (1,1,1) in mtx1 col0 (reg 0x04), rows 0..2.
+        c.vfpu[16 + 0] = 1.0f; c.vfpu[16 + 1] = 1.0f;
+        c.vfpu[16 + 2] = 1.0f;
+    };
+
+    // Identity baseline: vtfm3 C200, M000, C100 (vd=0x08).
+    setup(ctx);
+    vfpu_vtfm3(&ctx, nullptr, 0x08, 0x00, 0x04);
+    ASSERT_APPROX(ctx.vfpu[32 + 0], 6.0f, 1e-4f, "vtfm3 d0 raw");
+    ASSERT_APPROX(ctx.vfpu[32 + 1], 15.0f, 1e-4f, "vtfm3 d1 raw");
+    ASSERT_APPROX(ctx.vfpu[32 + 2], 24.0f, 1e-4f, "vtfm3 d2 raw");
+
+    // TPREFIX negates all three lanes -> last row only.
+    setup(ctx);
+    ctx.vfpu_ctrl[VFPU_CTRL_TPREFIX] = 0x000700E4u;  // neg lanes 0,1,2
+    vfpu_vtfm3(&ctx, nullptr, 0x08, 0x00, 0x04);
+    ASSERT_APPROX(ctx.vfpu[32 + 0], 6.0f, 1e-4f,
+                  "vtfm3 d0 stays raw under T prefix");
+    ASSERT_APPROX(ctx.vfpu[32 + 1], 15.0f, 1e-4f,
+                  "vtfm3 d1 stays raw under T prefix");
+    ASSERT_APPROX(ctx.vfpu[32 + 2], -24.0f, 1e-4f,
+                  "vtfm3 d2 reacts to last-row T prefix");
+}
+
+// ===================================================================
 // main
 // ===================================================================
 
@@ -679,6 +787,8 @@ int main() {
     test_sce_gum_ortho();
     test_vcmov_safe_normalize();
     test_lookat_forward_normalize();
+    test_vmmul_last_element_prefix();
+    test_vtfm_last_row_prefix();
 
     std::printf("\n%d tests run, %d failures\n",
                 tests_run, failures);
