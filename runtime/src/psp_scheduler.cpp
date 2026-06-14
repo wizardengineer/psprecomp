@@ -66,6 +66,25 @@ static void token_mark_granted(PspThread* t) {
     t->token_last_ran = g_token_grant_seq;
 }
 
+/// [H2] Promote a token grantee to RUNNING. A thread that HOLDS the run-token IS
+/// running guest code, so the grant must transition the grantee out of READY —
+/// otherwise a freshly-started producer parked in thread_entry_wrapper on the
+/// `status == RUNNING` predicate treats the grant's cv.notify as a SPURIOUS wake
+/// (predicate still false), re-sleeps, and STRANDS the token: it runs zero guest
+/// instructions until the 50ms force-run valve fires (the .hack CRI-producer
+/// stranding, sched-d-dothack-converge.md §1/§4 H2). select_next_runnable only
+/// ever grants to a READY or RUNNING thread (WAIT/WAIT_SLEEP/DORMANT are excluded
+/// from grantee eligibility), so this promotion only ever touches READY -> RUNNING
+/// and is idempotent for an already-RUNNING holder. Caller holds g_sched_mutex AND
+/// is on the ON path (every call site is gated by token_enabled()); never OFF, so
+/// OFF status transitions are byte-identical. WAIT/WAIT_SLEEP/DORMANT are left
+/// untouched defensively (must never reach here — see select_next_runnable).
+static void token_promote_to_running(PspThread* t) {
+    if (t->status == READY) {
+        t->status = RUNNING;
+    }
+}
+
 /// [approach (d) perf pass, M5/F1] ON-only diagnostic counters for the token
 /// wait valve. Incremented ONLY inside token_acquire, which returns at its OFF
 /// gate before reaching them, so OFF never touches these (OFF byte-identical).
@@ -162,6 +181,7 @@ static void token_release_to(PspThread* self) {
     }
     g_token_holder = next;
     token_mark_granted(next);  // [F2-core] stamp the grantee least-recently-ran
+    token_promote_to_running(next);  // [H2] grantee IS now running guest code
     for (int i = 0; i < MAX_THREADS; i++) {
         if (&g_threads[i] == next) {
             g_rr_cursor = i;
@@ -198,6 +218,7 @@ static void token_acquire(std::unique_lock<std::mutex>& lock, PspThread* self) {
     if (g_token_holder == nullptr) {
         g_token_holder = self;
         token_mark_granted(self);  // [F2-core] stamp self as just-ran
+        token_promote_to_running(self);  // [H2] holder IS running guest code
         return;
     }
     // [M5/F1] Predicated wait — no missed wake. The predicate also accepts a
@@ -223,6 +244,7 @@ static void token_acquire(std::unique_lock<std::mutex>& lock, PspThread* self) {
         if (g_token_holder == nullptr) {  // R2: claim the freed token
             g_token_holder = self;
             token_mark_granted(self);  // [F2-core] stamp self as just-ran
+            token_promote_to_running(self);  // [H2] holder IS running guest code
             ++g_valve_nullptr_claims;
         }
     }
