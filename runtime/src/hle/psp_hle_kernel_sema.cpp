@@ -233,7 +233,13 @@ static void hle_sceKernelWaitSema(
     int32_t signal = ctx->r[5];
     uint32_t timeout_ptr = static_cast<uint32_t>(ctx->r[6]);
 
-    sched_yield_point();
+    // [F2] OFF: leading cooperative yield (unchanged, byte-identical). ON: skip
+    // it — the subsequent sched_token_release_for_wait() is the sole hand-off
+    // for the parking path, and the fast (non-blocking acquire) path keeps the
+    // token under the one-runnable model.
+    if (!sched_token_enabled()) {
+        sched_yield_point();
+    }
 
     auto it = g_semaphores.find(uid);
     if (it == g_semaphores.end()) {
@@ -266,10 +272,17 @@ static void hle_sceKernelWaitSema(
         }
         std::unique_lock<std::mutex> lock(s->mtx);
         s->wait_count++;
+        // [M1.a] Single-runnable token (PSPRECOMP_PREEMPT): hand the run-token
+        // to a peer before parking on the deleted-sema condvar, reclaim on wake.
+        // Without this the deleted-path park held the token while asleep on a
+        // foreign cv, leaving the parked thread visible to select_next_runnable
+        // (lost-token risk). No-op when the flag is OFF (byte-identical).
+        sched_token_release_for_wait();
         bool got_it = s->cv.wait_for(lock,
             std::chrono::milliseconds(100),
             [&] { return s->current_count >= signal
                          && s->waiters.empty(); });
+        sched_token_reacquire_after_wait();
         if (got_it) {
             s->current_count -= signal;
         }
@@ -453,7 +466,12 @@ static void hle_sceKernelWaitSemaCB(
             // Single-runnable token (PSPRECOMP_PREEMPT): release across the
             // poll-loop park so peers advance; reclaim on wake. No-op when OFF.
             sched_token_release_for_wait();
-            s->cv.wait_for(lock, std::chrono::milliseconds(5),
+            // [M4] Poll cadence: OFF keeps EXACTLY 5ms (byte-identical callback
+            // pump — Patapon's asset/IO pump must not change OFF). ON gets a
+            // 100ms backstop (the cv already wakes on SignalSema's notify_all,
+            // so 100ms is a pure valve, not the wake mechanism).
+            s->cv.wait_for(lock,
+                std::chrono::milliseconds(sched_token_enabled() ? 100 : 5),
                 [&] { return (s->current_count >= signal
                               && s->waiters.empty())
                              || g_should_exit.load(); });

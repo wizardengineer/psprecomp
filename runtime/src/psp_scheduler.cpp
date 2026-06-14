@@ -2,6 +2,7 @@
 #include "psp_debug_socket.h"  // PspDebugThreadInfo ([#35] I command)
 #include "psp_vfpu.h"  // vfpu_init_context — VFPU prefix reset default
 #include "hle/psp_hle.h"  // SCE_KERNEL_ERROR_WAIT_TIMEOUT
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,10 +45,37 @@ static bool token_enabled();
 /// granted the token, so equal-priority peers take turns (PPSSPP pop_first).
 static int g_rr_cursor = 0;
 
+/// [approach (d) perf pass, M5/F1] ON-only diagnostic counters for the token
+/// wait valve. Incremented ONLY inside token_acquire, which returns at its OFF
+/// gate before reaching them, so OFF never touches these (OFF byte-identical).
+///   g_valve_timeout_wakes  : wait_for returned false (50ms backstop fired with
+///                            no predicate) — steady-state ~0 expected.
+///   g_valve_nullptr_claims : the FREE-accept branch claimed a void-released
+///                            token (R2) — small-and-bounded expected; a high or
+///                            growing rate signals a missed direct-grant.
+static std::atomic<uint64_t> g_valve_timeout_wakes{0};
+static std::atomic<uint64_t> g_valve_nullptr_claims{0};
+
 /// Select the next thread to receive the token: highest-priority READY/RUNNING
 /// thread (lowest priority number), round-robin within a priority, excluding
 /// `exclude`. Returns nullptr if none runnable. Caller holds g_sched_mutex.
+///
+/// [approach (d) perf pass — M1 INVARIANT] select_next_runnable excludes every
+/// token_parked thread; this is sound ONLY because every object-cv / busy-poll
+/// park that can block a PSP thread (eventflag, sema slow/CB/deleted, mutex,
+/// lwmutex, SendMsgPipe-full, and the render-queue GE/present round-trips on a
+/// PSP thread) brackets its wait with sched_token_release_for_wait() /
+/// sched_token_reacquire_after_wait(), holding token_parked for the entire park.
+/// A token_parked thread is NEVER g_token_holder — the three scheduler park
+/// sites (release_for_wait, sleep_current, wait_end) void-release the token
+/// (g_token_holder = nullptr) BEFORE parking. Render-thread cvs and real-time
+/// host sleeps (DelayThread, audio, vblank) are intentionally NOT bracketed —
+/// they are not PSP-thread peer parks. The debug-assert below enforces the
+/// holder/parked exclusivity (compiles out in NDEBUG; the body is unreachable
+/// OFF since g_token_holder stays nullptr).
 static PspThread* select_next_runnable(PspThread* exclude) {
+    assert(!(g_token_holder && g_token_holder->token_parked) &&
+           "INVARIANT: a token_parked thread is never g_token_holder");
     PspThread* best = nullptr;
     // Scan starting just after the RR cursor so equal-priority peers rotate.
     for (int n = 0; n < MAX_THREADS; n++) {
@@ -104,27 +132,80 @@ static void token_acquire(std::unique_lock<std::mutex>& lock, PspThread* self) {
     if (!token_enabled()) {
         return;
     }
-    // First-ever acquire: if the token is free, take it directly.
-    if (g_token_holder == nullptr) {
-        g_token_holder = self;
-        self->token_parked = false;
+    // [M2] Clear token_parked FIRST — before the first-free check and the wait
+    // loop. A thread re-contending for the token (via reacquire_after_wait, or
+    // the sleep/wait-end tails) is no longer parked on a FOREIGN object cv; it
+    // is now waiting on its OWN cv here, which is exactly a valid grantee. M2
+    // makes it immediately eligible so select_next_runnable / other_runnable_
+    // exists can grant+notify it directly, instead of leaving it invisible until
+    // the old after-loop clear (which forced the .hack producer's wakeup onto
+    // the 50ms valve — the perf collapse).
+    self->token_parked = false;
+    // [M2 guard] Load-bearing: if a grant was delivered to self during the
+    // thread_entry startup window (or any prior race) self may already hold the
+    // token — recover it cheaply, nothing to do. This is NOT the dropped M3
+    // keep-token path; it is a correctness guard for an already-granted holder.
+    if (g_token_holder == self) {
         return;
     }
+    // First-free fast path: if the token is free, take it directly.
+    if (g_token_holder == nullptr) {
+        g_token_holder = self;
+        return;
+    }
+    // [M5/F1] Predicated wait — no missed wake. The predicate also accepts a
+    // FREE token (R2): R1's void-release can leave g_token_holder == nullptr, so
+    // a peer parked here must be able to claim it. The in-body nullptr-claim is
+    // KEPT and is serialized by g_sched_mutex + the while re-check ⇒ exactly one
+    // claimant (two peers woken by the same void-release re-take the lock
+    // serially: the first sets g_token_holder = self and exits; the second
+    // re-checks the while condition, sees the holder is now the first peer, and
+    // re-parks). 50ms (SCHED_TIMEOUT_MS) is a pure backstop now (fires ~never).
     while (g_token_holder != self && !g_should_exit.load()) {
-        self->cv.wait_for(lock, std::chrono::milliseconds(SCHED_TIMEOUT_MS));
-        // Safety valve: if nobody holds the token, claim it.
-        if (g_token_holder == nullptr) {
+        bool woke = self->cv.wait_for(
+            lock,
+            std::chrono::milliseconds(SCHED_TIMEOUT_MS),
+            [&] {
+                return g_token_holder == self        // granted to me
+                    || g_token_holder == nullptr     // R2: freed — claimable
+                    || g_should_exit.load();
+            });
+        if (!woke) {
+            ++g_valve_timeout_wakes;  // 50ms backstop fired without predicate
+        }
+        if (g_token_holder == nullptr) {  // R2: claim the freed token
             g_token_holder = self;
+            ++g_valve_nullptr_claims;
         }
     }
-    self->token_parked = false;  // Holding the token now → eligible/running.
+}
+
+/// [F3] Is there ANY other runnable thread that could take the token? Reuses
+/// the EXACT eligibility predicate (excludes self, every token_parked thread,
+/// and any non-READY/RUNNING thread), so a parked producer never counts as
+/// "another runnable" — which is precisely why M1 (every object-cv park sets
+/// token_parked) is the precondition for this being safe. Caller holds
+/// g_sched_mutex.
+static bool other_runnable_exists(PspThread* self) {
+    return select_next_runnable(self) != nullptr;
 }
 
 /// Release the token held by `self` to a peer, then re-acquire (block until
 /// granted again). The unified hand-off used at every voluntary reschedule
 /// point. Caller holds g_sched_mutex via `lock`. No-op when the flag is OFF.
+/// This is the ONLY symmetric keep-token site (the holder stays RUNNING — it
+/// never blocks, it just yields); the three R1 park sites always void-release.
 static void token_handoff(std::unique_lock<std::mutex>& lock, PspThread* self) {
     if (!token_enabled() || g_token_holder != self) {
+        return;
+    }
+    // [F3] Sole-runnable fast path: if no other thread can take the token, keep
+    // it and continue — skip the release/reacquire round trip entirely (zero cv
+    // ops, one 64-slot scan). Safe because M1 makes every object-cv-parked peer
+    // token_parked (invisible to the scan) and M2 makes a re-contending peer
+    // visible the instant it re-enters token_acquire, so the holder hands off on
+    // its NEXT back-edge once a peer actually un-parks.
+    if (!other_runnable_exists(self)) {
         return;
     }
     token_release_to(self);
@@ -375,6 +456,14 @@ static bool sched_preempt_enabled() {
 /// Token gate uses the same flag (read once, cached) as the preempt hook.
 static bool token_enabled() {
     return sched_preempt_enabled();
+}
+
+/// [M4] Public face of the cached token gate — one source of truth. HLE wait
+/// stubs use this to gate ON-only timeout cadences and skip the redundant
+/// leading sched_yield_point() before an object-cv park (F2). OFF returns false,
+/// so every caller takes its OFF/legacy branch (byte-identical default path).
+bool sched_token_enabled() {
+    return token_enabled();
 }
 
 void sched_preempt(recomp_context* ctx) {

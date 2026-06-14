@@ -50,11 +50,17 @@ static constexpr int SCHED_TIMEOUT_MS = 50;
 /// points (#66, design approach (a)). The emitter decrements
 /// `ctx->preempt_budget` once per loop back-edge pass; when it reaches <= 0 the
 /// generated code calls `sched_preempt()`, which reloads it to this value. This
-/// is a generic, title-agnostic constant (purity gate): ~100k back-edge passes
+/// is a generic, title-agnostic constant (purity gate): ~20k back-edge passes
 /// between reschedule checks keeps the dead-effect counter overhead negligible
 /// on straight-line-dominated code while bounding how long a syscall-free spin
 /// runs before reaching a preemption point once the flag is enabled.
-static constexpr int32_t SCHED_PREEMPT_BUDGET = 100000;
+///
+/// [approach (d) perf pass, F4] 100000 -> 20000. After F3 makes a sole-runnable
+/// hand-off ~free, the budget's only remaining job ON is to bound producer-
+/// wakeup latency when a peer un-parks; 20k gives 5x finer granularity at
+/// negligible cost (one 64-slot scan per 20k back-edges). OFF this only changes
+/// the numeric constant written to ctx->preempt_budget; it still never yields.
+static constexpr int32_t SCHED_PREEMPT_BUDGET = 20000;
 
 /// Per-thread state for PSP cooperative scheduler.
 /// Each thread gets its own recomp_context (RUNTIME-01) so register state
@@ -128,6 +134,14 @@ void sched_preempt(recomp_context* ctx);
 /// called while it is already held.
 void sched_token_release_for_wait();
 void sched_token_reacquire_after_wait();
+
+/// Public predicate: is the single-runnable run-token engaged (PSPRECOMP_PREEMPT
+/// set)? Forwards to the cached internal token_enabled(); the single public face
+/// of that one source of truth. Used by HLE wait stubs (approach (d) perf pass)
+/// to gate ON-only timeout cadences (e.g. WaitSemaCB) and to skip the redundant
+/// leading sched_yield_point() before an object-cv park (F2). Returns false (so
+/// every gated branch is the OFF/legacy path) when the flag is unset.
+bool sched_token_enabled();
 
 /// Mark current thread DEAD, decrement g_alive_threads, wake next thread.
 void psp_thread_exit_current();

@@ -143,6 +143,15 @@ void lw_lock_blocking(uint8_t* rdram, recomp_context* ctx,
     auto deadline = std::chrono::steady_clock::now() +
         std::chrono::microseconds(raw_us);
 
+    // [M1.c] Single-runnable token (PSPRECOMP_PREEMPT): the thread is parked on
+    // the LwMutex cv for the WHOLE lifetime of this loop, so release the
+    // run-token to a peer ONCE before the loop and reclaim it ONCE after (every
+    // break falls through to the reacquire). Without this the blocking lwmutex
+    // park held the token while asleep on a foreign cv (lost-token risk). All
+    // branches inside hold only g_lw_mtx (never g_sched_mutex); the helpers take
+    // g_sched_mutex internally, preserving lock order object_mtx -> g_sched_mutex.
+    // No-op when the flag is OFF (byte-identical default path).
+    sched_token_release_for_wait();
     int32_t err = 0;
     for (;;) {
         if (lw_fast_lock(rdram, wa, count, &err)) {
@@ -189,6 +198,7 @@ void lw_lock_blocking(uint8_t* rdram, recomp_context* ctx,
         }
     }
     psp_thread_clear_wait();
+    sched_token_reacquire_after_wait();  // [M1.c] covers every break path
 }
 
 // ---- HLE Functions ----
@@ -280,7 +290,12 @@ void hle_sceKernelLockLwMutex(uint8_t* rdram, recomp_context* ctx) {
     int32_t count = ctx->r[5];
     uint32_t timeout_ptr = static_cast<uint32_t>(ctx->r[6]);
 
-    sched_yield_point();
+    // [F2] OFF: leading cooperative yield (unchanged, byte-identical). ON: skip
+    // it — lw_lock_blocking's release_for_wait is the sole hand-off; the fast
+    // lock path keeps the token under the one-runnable model.
+    if (!sched_token_enabled()) {
+        sched_yield_point();
+    }
 
     if (wa == 0) {
         ctx->r[2] = SCE_KERNEL_ERROR_ACCESS_ERROR;

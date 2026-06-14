@@ -1690,7 +1690,12 @@ static void hle_sceKernelSendMsgPipe(
     // r[7]=waitMode, r[9]=timeout*: send completes immediately
     // unless the pipe is full.
 
-    sched_yield_point();
+    // [F2] OFF: leading cooperative yield (unchanged, byte-identical). ON: skip
+    // it — the release/reacquire around the full-pipe sleep below is the sole
+    // hand-off; the common non-full path keeps the token (one-runnable model).
+    if (!sched_token_enabled()) {
+        sched_yield_point();
+    }
 
     for (int spins = 0; ; ++spins) {
         {
@@ -1723,7 +1728,17 @@ static void hle_sceKernelSendMsgPipe(
             ctx->r[2] = SCE_KERNEL_ERROR_MPP_FULL;
             return;
         }
+        // [M1.d] This is a producer-waits-on-consumer park: the FIFO drains only
+        // when a CONSUMER PSP thread runs TryReceiveMsgPipe. Under the flag, hand
+        // the run-token to that peer for the duration of the per-iteration sleep
+        // (sets token_parked), then reclaim it — otherwise the producer would
+        // hold the token across the whole 5s spin and the consumer could never
+        // run (permanent full-pipe stall). No-op when OFF; the poll cadence (1ms)
+        // is unchanged OFF, and on Patapon's 84-byte/1024-byte pipe the pipe
+        // never fills, so OFF never enters this branch (byte-identical).
+        sched_token_release_for_wait();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        sched_token_reacquire_after_wait();
     }
 }
 

@@ -4,6 +4,7 @@
 #include "psp_memory.h"
 #include "recomp.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -55,7 +56,11 @@ static void hle_sceKernelLockMutex(
     int uid = ctx->r[4];
     int32_t count = ctx->r[5];
 
-    sched_yield_point();
+    // [F2] OFF: leading cooperative yield (unchanged, byte-identical). ON: skip
+    // it — release_for_wait below is the sole hand-off for the blocking path.
+    if (!sched_token_enabled()) {
+        sched_yield_point();
+    }
 
     auto it = g_mutexes.find(uid);
     if (it == g_mutexes.end()) {
@@ -70,9 +75,23 @@ static void hle_sceKernelLockMutex(
     PspThread* t = psp_get_current_thread();
     int my_thid = t ? t->id : 0;
 
-    m->cv.wait(lock, [&] {
+    // [M1.b] Wire the run-token AND add a finite valve. The old wait was an
+    // UNBOUNDED m->cv.wait(pred) — no g_should_exit escape, no token_parked, so
+    // under the flag it held the token while asleep on a foreign cv (lost-token
+    // risk) and could hang forever on a missed notify. Replace with a finite
+    // 5s-valve loop bracketed by the token helpers. The valve only ADDS a wake;
+    // correctness on a real signal is unchanged (UnlockMutex still notify_one's).
+    // sched_token_* are no-ops when OFF; OFF behavior changes ONLY in the
+    // pathological missed-notify/shutdown case (previously a permanent hang).
+    auto acquired = [&] {
         return m->owner_thid == -1 || m->owner_thid == my_thid;
-    });
+    };
+    sched_token_release_for_wait();
+    while (!acquired() && !g_should_exit.load()) {
+        m->cv.wait_for(lock, std::chrono::seconds(5),
+            [&] { return acquired() || g_should_exit.load(); });
+    }
+    sched_token_reacquire_after_wait();
 
     m->owner_thid = my_thid;
     m->lock_count += count;

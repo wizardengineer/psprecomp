@@ -161,7 +161,12 @@ static void hle_sceKernelWaitEventFlag(
     uint32_t wait_mode = static_cast<uint32_t>(ctx->r[6]);
     uint32_t out_bits_ptr = static_cast<uint32_t>(ctx->r[7]);
 
-    sched_yield_point();
+    // [F2] OFF: leading cooperative yield (unchanged, byte-identical). ON: skip
+    // it — the sched_token_release_for_wait() below is the sole hand-off for the
+    // parking path.
+    if (!sched_token_enabled()) {
+        sched_yield_point();
+    }
 
     auto it = g_eventflags.find(uid);
     if (it == g_eventflags.end()) {
