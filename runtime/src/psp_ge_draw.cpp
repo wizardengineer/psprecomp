@@ -909,21 +909,33 @@ void ge_present_frame(
     (void)fb_format;
 
     // Select the FBO matching the displayed (scanned-out) VRAM address — the
-    // front buffer. On key miss (guest scans out a buffer the GE never
-    // rendered into this run) fall back to the most-recently-rendered target
-    // so present never blanks.
+    // front buffer. On key miss for a real (non-zero) address the guest is
+    // scanning out a VRAM buffer the GE has not rendered into yet (e.g. the
+    // first flip to the back buffer before any list targets it). Create that
+    // buffer's own FBO — cleared to black — and present THAT, rather than
+    // blitting an unrelated sibling slot (which would publish a different
+    // buffer's stale/cleared contents as if they were this frame). This keeps
+    // present strictly per-address: a fresh flip shows a clean buffer, and any
+    // geometry the GE later renders into this address lands in the same FBO.
     uint32_t key = ge_fb_key(fb_addr);
     int slot = -1;
     for (int i = 0; i < GE_MAX_TARGETS; ++i) {
         if (g_targets[i].fbo != 0 && g_targets[i].key == key) { slot = i; break; }
     }
     if (slot < 0) {
-        slot = (g_front_target >= 0) ? g_front_target : g_current_target;
-        static int fallback_count = 0;
-        if (++fallback_count <= 20) {
-            std::fprintf(stderr,
-                "[PRESENT] fallback: no FBO for fb=0x%08X key=0x%06X "
-                "(using slot=%d)\n", fb_addr, key, slot);
+        if (key != 0) {
+            // Materialize the displayed buffer's own (cleared) FBO.
+            slot = acquire_target(key);
+        } else {
+            // key==0 (FRAMEBUFPTR/displayed addr not yet meaningful): keep the
+            // most-recently-rendered target so present never blanks.
+            slot = (g_front_target >= 0) ? g_front_target : g_current_target;
+            static int fallback_count = 0;
+            if (++fallback_count <= 20) {
+                std::fprintf(stderr,
+                    "[PRESENT] fallback: no FBO for fb=0x%08X key=0x%06X "
+                    "(using slot=%d)\n", fb_addr, key, slot);
+            }
         }
     }
     if (slot < 0) return;  // nothing rendered yet
