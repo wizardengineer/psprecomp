@@ -9,6 +9,7 @@
 #include <SDL.h>
 #include <glad/glad.h>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <vector>
@@ -16,10 +17,42 @@
 #include <cstdlib>
 #include <cstring>
 
+// ---- Generic FBO pool (issue #59 — honor fb_addr / double buffer) ----
+// One GL FBO per distinct guest VRAM framebuffer address. The GE binds the
+// FBO for the current FRAMEBUFPTR; present blits the FBO matching the
+// displayed (sceDisplaySetFrameBuf) address. Keying on the guest's own
+// addresses keeps this generic: a single-buffered title keys everything to
+// one slot and degenerates to the old single-surface behavior.
+static constexpr int GE_MAX_TARGETS = 4;
+
+struct GeTarget {
+    uint32_t key = 0;          // fb_addr normalized to eDRAM offset (0 = empty)
+    GLuint fbo = 0;
+    GLuint color_tex = 0;
+    GLuint depth_rb = 0;
+    uint64_t last_use = 0;     // LRU stamp (monotonic counter)
+};
+
+static GeTarget g_targets[GE_MAX_TARGETS];
+static int g_current_target = -1;   // slot the GE is rendering into
+static int g_front_target = -1;     // slot last presented / most recent render
+static uint64_t g_target_clock = 0; // monotonic LRU counter
+
+// Normalize any guest framebuffer address to its eDRAM 2 MB offset key.
+// Strips the cached/uncached/eDRAM base via the canonical 0x07FFFFFF PSP
+// mask, then takes the 16-byte-aligned eDRAM offset (PPSSPP model). Used by
+// both ge_draw_select_target (FRAMEBUFPTR) and ge_present_frame
+// (sceDisplaySetFrameBuf) so the two address spaces reconcile.
+static inline uint32_t ge_fb_key(uint32_t addr) {
+    return (addr & 0x07FFFFFFu) & 0x001FFFF0u;
+}
+
+// ---- Liveness present (no-flip safety net) ----
+static bool g_present_dirty = false;
+static std::chrono::steady_clock::time_point g_last_present;
+static int g_present_stale_ms = 100;   // PSPRECOMP_PRESENT_STALE_MS
+
 // ---- Module state ----
-static GLuint g_fbo = 0;
-static GLuint g_fbo_color_tex = 0;
-static GLuint g_fbo_depth_rb = 0;
 static GLuint g_vao = 0;
 static GLuint g_vbo = 0;
 static uint32_t g_frame_counter = 0;
@@ -104,9 +137,18 @@ static bool write_tga(
     return true;
 }
 
+// Resolve the FBO id of the most-recently-presented (front) target, or the
+// current render target as a fallback. Returns 0 if no target exists yet.
+static GLuint front_fbo_id() {
+    if (g_front_target >= 0) return g_targets[g_front_target].fbo;
+    if (g_current_target >= 0) return g_targets[g_current_target].fbo;
+    return 0;
+}
+
 /// Read the FBO back, flip, and write a TGA. Render (GL) thread only.
 static bool capture_fbo_to_tga(const char* path) {
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+    GLuint fbo = front_fbo_id();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
     std::vector<uint8_t> pixels(480 * 272 * 4);
     glReadPixels(0, 0, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
     // Flip vertically (GL origin is bottom-left)
@@ -250,6 +292,92 @@ static bool depth_range_reversed(const GeViewportDepth& vp) {
     return vp.near_z > vp.far_z;
 }
 
+// ---- FBO pool helpers ----
+
+// Create one render target (FBO + RGBA8 color texture + Depth24 renderbuffer,
+// 480x272, NEAREST) for the given normalized key. Clears it to black. The
+// pool owns the GL objects; ge_draw_shutdown deletes them.
+static GeTarget make_target(uint32_t key) {
+    GeTarget t;
+    t.key = key;
+    glGenFramebuffers(1, &t.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
+
+    glGenTextures(1, &t.color_tex);
+    glBindTexture(GL_TEXTURE_2D, t.color_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 480, 272, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, t.color_tex, 0);
+
+    glGenRenderbuffers(1, &t.depth_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, t.depth_rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 480, 272);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                              GL_RENDERBUFFER, t.depth_rb);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        std::fprintf(stderr, "[DRAW] FBO incomplete: 0x%04X (key=0x%06X)\n",
+                     status, key);
+    }
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    t.last_use = ++g_target_clock;
+    return t;
+}
+
+// Find the pool slot for key, or allocate one (LRU-evicting if full).
+static int acquire_target(uint32_t key) {
+    for (int i = 0; i < GE_MAX_TARGETS; ++i) {
+        if (g_targets[i].fbo != 0 && g_targets[i].key == key) {
+            g_targets[i].last_use = ++g_target_clock;
+            return i;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < GE_MAX_TARGETS; ++i) {
+        if (g_targets[i].fbo == 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+        slot = 0;  // LRU evict
+        for (int i = 1; i < GE_MAX_TARGETS; ++i) {
+            if (g_targets[i].last_use < g_targets[slot].last_use) slot = i;
+        }
+        std::fprintf(stderr,
+            "[DRAW] FBO pool overflow: evicting key=0x%06X for key=0x%06X\n",
+            g_targets[slot].key, key);
+        glDeleteFramebuffers(1, &g_targets[slot].fbo);
+        glDeleteTextures(1, &g_targets[slot].color_tex);
+        glDeleteRenderbuffers(1, &g_targets[slot].depth_rb);
+    }
+    g_targets[slot] = make_target(key);
+    std::fprintf(stderr, "[DRAW] FBO target created key=0x%06X slot=%d\n",
+                 key, slot);
+    return slot;
+}
+
+// Bind the FBO for the current FRAMEBUFPTR. key==0 (FRAMEBUFPTR not yet seen)
+// keeps the current/last target so early lists still land somewhere.
+void ge_draw_select_target(uint32_t fb_addr_raw) {
+    uint32_t key = ge_fb_key(fb_addr_raw);
+    if (key == 0) {
+        if (g_current_target < 0) g_current_target = acquire_target(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_targets[g_current_target].fbo);
+        return;
+    }
+    int slot = acquire_target(key);
+    g_current_target = slot;
+    if (g_front_target < 0) g_front_target = slot;
+    glBindFramebuffer(GL_FRAMEBUFFER, g_targets[slot].fbo);
+}
+
+void ge_draw_mark_dirty() {
+    g_present_dirty = true;
+}
+
 // ---- Public API ----
 
 void ge_draw_init() {
@@ -262,47 +390,16 @@ void ge_draw_init() {
                      sizeof(g_screenshot_path) - 1);
     }
 
-    // Create FBO (480x272, RGBA8 + Depth24)
-    glGenFramebuffers(1, &g_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-
-    // Color attachment (texture)
-    glGenTextures(1, &g_fbo_color_tex);
-    glBindTexture(GL_TEXTURE_2D, g_fbo_color_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-                 480, 272, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D,
-                    GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D,
-                    GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glFramebufferTexture2D(
-        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-        GL_TEXTURE_2D, g_fbo_color_tex, 0);
-
-    // Depth attachment (renderbuffer)
-    glGenRenderbuffers(1, &g_fbo_depth_rb);
-    glBindRenderbuffer(GL_RENDERBUFFER, g_fbo_depth_rb);
-    glRenderbufferStorage(GL_RENDERBUFFER,
-                          GL_DEPTH_COMPONENT24, 480, 272);
-    glFramebufferRenderbuffer(
-        GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-        GL_RENDERBUFFER, g_fbo_depth_rb);
-
-    // Check completeness
-    GLenum status = glCheckFramebufferStatus(
-        GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        std::fprintf(stderr,
-            "[DRAW] FBO incomplete: 0x%04X\n", status);
-    } else {
-        std::fprintf(stderr,
-            "[DRAW] FBO created (480x272, RGBA8+D24)\n");
+    // Liveness-present budget (no-flip safety net). Env-overridable.
+    const char* stale_env = std::getenv("PSPRECOMP_PRESENT_STALE_MS");
+    if (stale_env && stale_env[0]) {
+        int v = std::atoi(stale_env);
+        if (v > 0) g_present_stale_ms = v;
     }
+    g_last_present = std::chrono::steady_clock::now();
 
-    // Clear FBO to black
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // FBO targets are created lazily per guest framebuffer address by
+    // ge_draw_select_target. No target is pre-created here.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // Create VAO + VBO
@@ -350,7 +447,7 @@ void ge_draw_shutdown() {
     g_draw_ready.store(false, std::memory_order_release);
     // Auto-capture final frame if any PRIMs were rendered and no screenshot taken yet
     if (g_has_drawn_prims && !g_screenshot_done) {
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, front_fbo_id());
         std::vector<uint8_t> pixels(480 * 272 * 4);
         glReadPixels(0, 0, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
         // Flip vertically (GL origin is bottom-left)
@@ -376,25 +473,25 @@ void ge_draw_shutdown() {
         glDeleteVertexArrays(1, &g_vao);
         g_vao = 0;
     }
-    if (g_fbo_depth_rb) {
-        glDeleteRenderbuffers(1, &g_fbo_depth_rb);
-        g_fbo_depth_rb = 0;
+    for (int i = 0; i < GE_MAX_TARGETS; ++i) {
+        GeTarget& t = g_targets[i];
+        if (t.depth_rb) glDeleteRenderbuffers(1, &t.depth_rb);
+        if (t.color_tex) glDeleteTextures(1, &t.color_tex);
+        if (t.fbo) glDeleteFramebuffers(1, &t.fbo);
+        t = GeTarget{};
     }
-    if (g_fbo_color_tex) {
-        glDeleteTextures(1, &g_fbo_color_tex);
-        g_fbo_color_tex = 0;
-    }
-    if (g_fbo) {
-        glDeleteFramebuffers(1, &g_fbo);
-        g_fbo = 0;
-    }
+    g_current_target = -1;
+    g_front_target = -1;
 
     std::fprintf(stderr,
         "[DRAW] Draw infrastructure shutdown\n");
 }
 
 void ge_draw_begin_list() {
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    // Bind the FBO for the list's current render-target address (FRAMEBUFPTR).
+    // Geometry and clears in this list now target the per-address FBO, so a
+    // clear to address X cannot wipe geometry on address Y (issue #59).
+    ge_draw_select_target(ge_get_state().framebuf_ptr);
     // Full-buffer default; the precise PSP viewport (scale/offset + depth
     // range) is applied per-PRIM in ge_draw_prim from the live registers,
     // which may be set after begin_list (issue #23).
@@ -403,7 +500,9 @@ void ge_draw_begin_list() {
 }
 
 void ge_draw_end_list() {
-    // Placeholder for future batching
+    // Mark the front buffer dirty so the liveness net can publish content
+    // even for a title that draws but never calls sceDisplaySetFrameBuf.
+    ge_draw_mark_dirty();
 }
 
 void ge_draw_prim(
@@ -764,6 +863,41 @@ void ge_draw_prim(
     glBindVertexArray(0);
 }
 
+// Service the pending screenshot/auto-capture from the given front FBO.
+static void present_service_screenshot(GLuint fbo) {
+    if (!g_screenshot_enabled || g_screenshot_done || !g_has_drawn_prims) {
+        return;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    std::vector<uint8_t> pixels(480 * 272 * 4);
+    glReadPixels(0, 0, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    std::vector<uint8_t> flipped(480 * 272 * 4);
+    for (int y = 0; y < 272; y++) {
+        std::memcpy(flipped.data() + y * 480 * 4,
+                    pixels.data() + (271 - y) * 480 * 4, 480 * 4);
+    }
+    write_tga(g_screenshot_path, flipped.data(), 480, 272);
+    g_screenshot_done = true;
+}
+
+// Blit the given front FBO to the window and swap. Common to the routine
+// (page-flip) present and the liveness net.
+static void present_blit(GLuint fbo) {
+    SDL_Window* window = psp_get_sdl_window();
+    if (!window) return;
+    present_service_screenshot(fbo);
+    int win_w = 480, win_h = 272;
+    SDL_GetWindowSize(window, &win_w, &win_h);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, 480, 272, 0, 0, win_w, win_h,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    SDL_GL_SwapWindow(window);
+    g_present_dirty = false;
+    g_last_present = std::chrono::steady_clock::now();
+}
+
 void ge_present_frame(
     uint8_t* rdram,
     uint32_t fb_addr,
@@ -771,65 +905,53 @@ void ge_present_frame(
     uint32_t fb_format
 ) {
     (void)rdram;
-    (void)fb_addr;
     (void)fb_stride;
     (void)fb_format;
 
-    SDL_Window* window = psp_get_sdl_window();
-    if (!window) return;
+    // Select the FBO matching the displayed (scanned-out) VRAM address — the
+    // front buffer. On key miss (guest scans out a buffer the GE never
+    // rendered into this run) fall back to the most-recently-rendered target
+    // so present never blanks.
+    uint32_t key = ge_fb_key(fb_addr);
+    int slot = -1;
+    for (int i = 0; i < GE_MAX_TARGETS; ++i) {
+        if (g_targets[i].fbo != 0 && g_targets[i].key == key) { slot = i; break; }
+    }
+    if (slot < 0) {
+        slot = (g_front_target >= 0) ? g_front_target : g_current_target;
+        static int fallback_count = 0;
+        if (++fallback_count <= 20) {
+            std::fprintf(stderr,
+                "[PRESENT] fallback: no FBO for fb=0x%08X key=0x%06X "
+                "(using slot=%d)\n", fb_addr, key, slot);
+        }
+    }
+    if (slot < 0) return;  // nothing rendered yet
+
+    g_front_target = slot;
+    g_targets[slot].last_use = ++g_target_clock;
 
     static int present_count = 0;
-    present_count++;
-    if (present_count <= 5) {
+    if (++present_count <= 5) {
         std::fprintf(stderr,
-            "[PRESENT] Frame %d (fb=0x%08X stride=%u fmt=%u)\n",
-            present_count, fb_addr, fb_stride, fb_format);
+            "[PRESENT] Frame %d (fb=0x%08X key=0x%06X stride=%u fmt=%u)\n",
+            present_count, fb_addr, key, fb_stride, fb_format);
     }
+    present_blit(g_targets[slot].fbo);
+}
 
-    // Screenshot capture (only after actual PRIM drawing)
-    if (present_count <= 5) {
-        std::fprintf(stderr,
-            "[PRESENT] Screenshot check: enabled=%d done=%d "
-            "has_prims=%d\n",
-            g_screenshot_enabled ? 1 : 0,
-            g_screenshot_done ? 1 : 0,
-            g_has_drawn_prims ? 1 : 0);
-    }
-    if (g_screenshot_enabled && !g_screenshot_done
-        && g_has_drawn_prims) {
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
-        std::vector<uint8_t> pixels(480 * 272 * 4);
-        glReadPixels(0, 0, 480, 272,
-                     GL_RGBA, GL_UNSIGNED_BYTE,
-                     pixels.data());
-
-        // Flip vertically (GL origin is bottom-left)
-        std::vector<uint8_t> flipped(480 * 272 * 4);
-        for (int y = 0; y < 272; y++) {
-            std::memcpy(
-                flipped.data() + y * 480 * 4,
-                pixels.data() + (271 - y) * 480 * 4,
-                480 * 4);
-        }
-
-        write_tga(g_screenshot_path, flipped.data(),
-                  480, 272);
-        g_screenshot_done = true;
-    }
-
-    // Blit FBO to default framebuffer
-    int win_w = 480, win_h = 272;
-    SDL_GetWindowSize(window, &win_w, &win_h);
-
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glBlitFramebuffer(
-        0, 0, 480, 272,
-        0, 0, win_w, win_h,
-        GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    SDL_GL_SwapWindow(window);
+// Liveness net (§2.1): if lists were processed but no real page-flip arrived
+// within the stale budget, present the current front buffer once. Preserves
+// "content becomes visible even without a flip" without making every list a
+// frame boundary. Main (GL) thread only — same thread as the routine present.
+void ge_draw_present_if_stale(uint8_t* rdram) {
+    (void)rdram;
+    if (!g_present_dirty) return;
+    auto age = std::chrono::steady_clock::now() - g_last_present;
+    if (age < std::chrono::milliseconds(g_present_stale_ms)) return;
+    GLuint fbo = front_fbo_id();
+    if (fbo == 0) { g_present_dirty = false; return; }
+    present_blit(fbo);
 }
 
 // ---- Debug socket accessors (issue #35) ----

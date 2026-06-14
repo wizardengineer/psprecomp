@@ -142,8 +142,6 @@ int psp_runtime_init_sdl() {
 // psp_event_loop — main-thread loop: SDL events + render queue + alive check
 // ---------------------------------------------------------------------------
 void psp_event_loop(uint8_t* rdram) {
-    (void)rdram;  // Currently unused; Phase 5 may need it
-
     while (!g_should_exit.load()) {
         // 1. Pump SDL events (window close, keyboard input)
         SDL_Event ev;
@@ -153,6 +151,11 @@ void psp_event_loop(uint8_t* rdram) {
 
         // 2. Drain render queue — execute pending GL work from game threads
         render_queue_process();
+
+        // 2a. Liveness net (issue #59): present the front buffer if lists
+        //     were processed but no real page-flip arrived recently. No-op
+        //     when a flip just presented (not dirty / within budget).
+        ge_draw_present_if_stale(rdram);
 
         // 2b. Service any pending debug-socket screenshot request here on
         //     the main (GL) thread — the socket thread never touches GL.
@@ -171,6 +174,7 @@ void psp_event_loop(uint8_t* rdram) {
                     handle_sdl_event(ev);
                 }
                 render_queue_process();
+                ge_draw_present_if_stale(rdram);
                 ge_draw_service_screenshot_request();
                 SDL_Delay(16);  // ~60fps drain rate
             }

@@ -200,14 +200,13 @@ GeListResult ge_process_display_list(
                     "[GE] END at 0x%08X (%d PRIMs, %d cmds)\n",
                     pc, prim_count, cmd_count);
             }
-            ge_draw_end_list();
+            ge_draw_end_list();   // marks front buffer dirty (liveness net)
             g_total_lists++;
-            // Auto-present if this list drew anything — ensures
-            // rendered content is visible even if the game doesn't
-            // call sceDisplaySetFrameBuf again immediately.
-            if (prim_count > 0) {
-                ge_present_frame(rdram, 0, 0, 0);
-            }
+            // Present is decoupled from list completion (issue #59): it is
+            // driven only by the guest's page-flip (sceDisplaySetFrameBuf),
+            // with ge_draw_present_if_stale as a no-flip safety net. The
+            // per-END auto-present was removed — it published intermediate
+            // buffers (e.g. a trailing clear) as if they were frames.
             return GeListResult{pc + 4, true, prim_count};
 
         case GE_CMD_FINISH: {
@@ -655,6 +654,10 @@ GeListResult ge_process_display_list(
         // ---- Framebuffer ----
         case GE_CMD_FRAMEBUFPTR:
             g_ge_state.framebuf_ptr = data;
+            // Bind-on-FRAMEBUFPTR (issue #59): a list that switches its
+            // render target mid-stream (clear buffer A then draw buffer B)
+            // must composite into the right per-address FBO. Cheap (a bind).
+            ge_draw_select_target(g_ge_state.framebuf_ptr);
             break;
         case GE_CMD_FRAMEBUFWIDTH:
             g_ge_state.framebuf_width = data;
