@@ -198,7 +198,17 @@ void lw_lock_blocking(uint8_t* rdram, recomp_context* ctx,
         }
     }
     psp_thread_clear_wait();
-    sched_token_reacquire_after_wait();  // [M1.c] covers every break path
+    // [F1] Un-nest the blocking token re-acquire from under g_lw_mtx: drop
+    // g_lw_mtx -> token_acquire -> re-take g_lw_mtx (sched_token_reacquire_
+    // unlocked). Every break above is final under g_lw_mtx — on the success
+    // break lw_fast_lock already committed our ownership to the workarea, so a
+    // peer cannot steal the lock while g_lw_mtx is dropped (no re-check needed);
+    // the error/timeout breaks set ctx->r[2] definitively. Without un-nesting, a
+    // contender parked in token_acquire would strand g_lw_mtx and UnlockLwMutex's
+    // cv.notify_all (which takes g_lw_mtx) would block on it — the AB-BA livelock
+    // (.hack's CriCond ring class). OFF: sched_token_reacquire_unlocked is a
+    // no-op, so g_lw_mtx is held across exactly the original loop (byte-identical).
+    sched_token_reacquire_unlocked(lock);  // [M1.c/F1] covers every break path
 }
 
 // ---- HLE Functions ----

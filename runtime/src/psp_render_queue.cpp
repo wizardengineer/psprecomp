@@ -61,7 +61,16 @@ void render_queue_post(RenderRequest& req) {
     g_render_cv.wait(lock, [] {
         return g_render_req.done || g_should_exit.load();
     });
-    sched_token_reacquire_after_wait();
+    // [F1] Un-nest the blocking token re-acquire from under g_render_mutex: drop
+    // it -> token_acquire -> re-take (sched_token_reacquire_unlocked). The wait
+    // predicate (g_render_req.done) is already satisfied and monotonic, so no
+    // re-check is needed; the function returns immediately after. Without un-
+    // nesting, a PSP thread parked in token_acquire would strand g_render_mutex
+    // and the main render thread's render_queue_process (which takes g_render_
+    // mutex) would block on it. OFF: sched_token_reacquire_unlocked is a no-op,
+    // so g_render_mutex is held across exactly the original wait (byte-identical),
+    // and on a non-PSP thread (g_current == null) it is also a no-op.
+    sched_token_reacquire_unlocked(lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +151,15 @@ int render_queue_draw_sync(int mode) {
         bool drained = g_ge_done_cv.wait_for(lock,
             std::chrono::milliseconds(500),
             [] { return g_ge_queue.empty() || g_should_exit.load(); });
-        sched_token_reacquire_after_wait();
+        // [F1] Un-nest the blocking token re-acquire from under g_render_mutex:
+        // drop it -> token_acquire -> re-take (sched_token_reacquire_unlocked).
+        // `drained` was decided under the lock and is only used for a log below;
+        // the 500ms valve result stands (no re-check needed). Without un-nesting,
+        // a PSP thread parked in token_acquire would strand g_render_mutex and the
+        // render thread's render_queue_process would block on it. OFF: no-op
+        // (g_render_mutex held across exactly the original wait, byte-identical);
+        // non-PSP thread: also a no-op.
+        sched_token_reacquire_unlocked(lock);
         if (!drained) {
             std::fprintf(stderr,
                 "[GE] DrawSync timeout: %zu lists still pending\n",

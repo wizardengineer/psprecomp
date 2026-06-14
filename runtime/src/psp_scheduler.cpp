@@ -513,6 +513,40 @@ void sched_token_reacquire_after_wait() {
 }
 
 // ---------------------------------------------------------------------------
+// sched_token_reacquire_unlocked — [F1] un-nest the blocking token re-acquire.
+//
+// On entry the caller holds `lock` on its OBJECT/RENDER mutex (taken on cv-wake;
+// std::condition_variable re-locks it before wait_for/wait returns). The blocking
+// token re-acquire (token_acquire, which parks on self's cv when another thread
+// holds the token) MUST NOT run while that object mutex is held, or the parked
+// thread strands the object mutex and forms an AB-BA deadlock with the producer
+// that needs it (the PREEMPT=1 livelock RCA, .planning/research/
+// sched-d-hazard1-rca.md §2.1). So: drop the object mutex, re-acquire the token
+// with NO object mutex held, then re-take the object mutex. The caller re-checks
+// its wait predicate after this returns (the object state may have changed while
+// the mutex was dropped).
+//
+// OFF (PSPRECOMP_PREEMPT unset): a literal no-op — `lock` is NOT unlocked or
+// relocked, so the caller's mutex stays held across exactly the same critical
+// section as before this F1 change (OFF byte-identical, zero extra mutex ops).
+// ---------------------------------------------------------------------------
+void sched_token_reacquire_unlocked(std::unique_lock<std::mutex>& lock) {
+    if (!token_enabled() || !g_current) {
+        return;  // OFF / non-PSP thread: leave `lock` exactly as received.
+    }
+    // Drop the object mutex BEFORE the blocking token re-acquire, then re-take
+    // it. token_acquire takes g_sched_mutex internally (object_mtx is NOT held
+    // here, so the disciplined order object_mtx -> g_sched_mutex is preserved
+    // and no object mutex can be stranded across the block).
+    lock.unlock();
+    {
+        std::unique_lock<std::mutex> sched_lock(g_sched_mutex);
+        token_acquire(sched_lock, g_current);
+    }
+    lock.lock();
+}
+
+// ---------------------------------------------------------------------------
 // psp_thread_exit_current — mark DEAD, decrement counter, wake next
 // ---------------------------------------------------------------------------
 void psp_thread_exit_current() {

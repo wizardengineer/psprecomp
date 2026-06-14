@@ -277,12 +277,21 @@ static void hle_sceKernelWaitSema(
         // Without this the deleted-path park held the token while asleep on a
         // foreign cv, leaving the parked thread visible to select_next_runnable
         // (lost-token risk). No-op when the flag is OFF (byte-identical).
+        //
+        // [F1] Un-nest the blocking token re-acquire: park on the cv under
+        // s->mtx (as before), but reacquire the token via the UNLOCKED helper
+        // (drop s->mtx -> token_acquire -> re-take s->mtx) so the blocking
+        // re-acquire never strands s->mtx (AB-BA livelock). The 100ms valve is
+        // unchanged. OFF: the helper is a no-op (s->mtx held across exactly the
+        // original single cv.wait_for, byte-identical); the predicate is the
+        // same so a no-op re-check keeps the result identical.
+        auto sema_ready = [&] {
+            return s->current_count >= signal && s->waiters.empty();
+        };
         sched_token_release_for_wait();
-        bool got_it = s->cv.wait_for(lock,
-            std::chrono::milliseconds(100),
-            [&] { return s->current_count >= signal
-                         && s->waiters.empty(); });
-        sched_token_reacquire_after_wait();
+        s->cv.wait_for(lock, std::chrono::milliseconds(100), sema_ready);
+        sched_token_reacquire_unlocked(lock);  // [F1] no object mutex held
+        bool got_it = sema_ready();  // [F1] re-check after the dropped-mutex window
         if (got_it) {
             s->current_count -= signal;
         }
@@ -348,7 +357,10 @@ static void hle_sceKernelWaitSema(
             sema_remove_waiter(*s, &waiter);
             s->wait_count--;
             psp_thread_clear_wait();
-            sched_token_reacquire_after_wait();
+            // [F1] Un-nest the blocking re-acquire: the waiter is already off the
+            // queue, so dropping s->mtx here cannot dangle the queue pointer; the
+            // result (TIMEOUT) was decided under the lock and is final. OFF no-op.
+            sched_token_reacquire_unlocked(lock);
             ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
             return;
         }
@@ -367,14 +379,18 @@ static void hle_sceKernelWaitSema(
             sema_remove_waiter(*s, &waiter);
             s->wait_count--;
             psp_thread_clear_wait();
-            sched_token_reacquire_after_wait();
+            // [F1] Un-nest: waiter already removed; result final. OFF no-op.
+            sched_token_reacquire_unlocked(lock);
             ctx->r[2] = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
             return;
         }
     }
     s->wait_count--;
     psp_thread_clear_wait();
-    sched_token_reacquire_after_wait();
+    // [F1] Granted path: the signaller already popped this waiter and transferred
+    // the count (waiter.granted is monotonic-true), so dropping s->mtx for the
+    // re-acquire is safe and needs no re-check. OFF no-op (s->mtx stays held).
+    sched_token_reacquire_unlocked(lock);
 
     // Granted: the signaller already transferred the count to us --
     // do NOT decrement current_count here.
@@ -475,7 +491,13 @@ static void hle_sceKernelWaitSemaCB(
                 [&] { return (s->current_count >= signal
                               && s->waiters.empty())
                              || g_should_exit.load(); });
-            sched_token_reacquire_after_wait();
+            // [F1] Un-nest the blocking re-acquire: drop s->mtx -> reacquire the
+            // token -> re-take s->mtx, so the poll loop never holds s->mtx while
+            // blocked in token_acquire (the AB-BA livelock). The existing outer
+            // `while` re-checks acquire_ok() under s->mtx at the top (the TOCTOU
+            // window from the dropped mutex is already covered). OFF: no-op, the
+            // 5ms-cadence poll runs byte-identically with s->mtx held throughout.
+            sched_token_reacquire_unlocked(lock);
             s->wait_count--;
             // Do NOT decrement here — re-check at top of loop
         }

@@ -135,6 +135,22 @@ void sched_preempt(recomp_context* ctx);
 void sched_token_release_for_wait();
 void sched_token_reacquire_after_wait();
 
+/// [F1] Un-nested blocking token re-acquire — the ONLY safe way to re-take the
+/// run-token after an object-cv park. INVARIANT (load-bearing): the blocking
+/// token re-acquire must run with NO object/render mutex held, else a thread can
+/// strand the object mutex while parked in token_acquire and form an AB-BA
+/// deadlock with the producer that needs that mutex (the PREEMPT=1 GE/CRI-ring
+/// livelock). This helper enforces it: it UNLOCKS the caller's object lock,
+/// re-acquires the token (with the object mutex dropped), then RE-LOCKS the
+/// object lock — so on return the caller holds the object mutex again and MUST
+/// re-check its wait predicate (state may have changed while the mutex was
+/// dropped). It is a literal NO-OP when PSPRECOMP_PREEMPT is OFF: the lock is
+/// never unlocked/relocked and `lock` is returned untouched (OFF byte-identical,
+/// zero extra mutex ops). Replaces a bare sched_token_reacquire_after_wait()
+/// that was called while the object lock was still held. `lock` MUST own its
+/// mutex on entry.
+void sched_token_reacquire_unlocked(std::unique_lock<std::mutex>& lock);
+
 /// Public predicate: is the single-runnable run-token engaged (PSPRECOMP_PREEMPT
 /// set)? Forwards to the cached internal token_enabled(); the single public face
 /// of that one source of truth. Used by HLE wait stubs (approach (d) perf pass)

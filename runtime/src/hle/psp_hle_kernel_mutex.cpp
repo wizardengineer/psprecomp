@@ -86,12 +86,33 @@ static void hle_sceKernelLockMutex(
     auto acquired = [&] {
         return m->owner_thid == -1 || m->owner_thid == my_thid;
     };
+    // [F1] Un-nest the blocking token re-acquire from under m->mtx. Park on the
+    // cv under m->mtx (as before), but reacquire the token with m->mtx DROPPED
+    // (sched_token_reacquire_unlocked: unlock -> token_acquire -> re-lock), then
+    // re-check acquired() under the re-taken m->mtx — the owner may have changed
+    // while m->mtx was dropped. Without this, a contender parked in token_acquire
+    // would strand m->mtx and UnlockMutex would block on it (AB-BA livelock). The
+    // 5s valve is unchanged. OFF: sched_token_reacquire_unlocked is a no-op, so
+    // m->mtx is held across exactly the original cv-wait loop and the reacquire
+    // adds nothing (byte-identical; only the pathological missed-notify case,
+    // already covered by the existing valve, differs).
     sched_token_release_for_wait();
     while (!acquired() && !g_should_exit.load()) {
         m->cv.wait_for(lock, std::chrono::seconds(5),
             [&] { return acquired() || g_should_exit.load(); });
     }
-    sched_token_reacquire_after_wait();
+    sched_token_reacquire_unlocked(lock);  // [F1] re-acquire with m->mtx dropped
+    // [F1] Re-validate under the re-taken m->mtx: the owner may have flipped while
+    // m->mtx was dropped during the token re-acquire. If we lost the race, re-park
+    // (ON only — OFF never released the token, so acquired() is already final and
+    // this guard re-checks the same continuously-locked predicate ⇒ no extra
+    // iteration OFF, byte-identical).
+    while (sched_token_enabled() && !acquired() && !g_should_exit.load()) {
+        sched_token_release_for_wait();
+        m->cv.wait_for(lock, std::chrono::seconds(5),
+            [&] { return acquired() || g_should_exit.load(); });
+        sched_token_reacquire_unlocked(lock);
+    }
 
     m->owner_thid = my_thid;
     m->lock_count += count;

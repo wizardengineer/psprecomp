@@ -1736,6 +1736,12 @@ static void hle_sceKernelSendMsgPipe(
         // run (permanent full-pipe stall). No-op when OFF; the poll cadence (1ms)
         // is unchanged OFF, and on Patapon's 84-byte/1024-byte pipe the pipe
         // never fills, so OFF never enters this branch (byte-identical).
+        //
+        // [F1] Already un-nested by construction: g_msgpipe_mtx is held only in
+        // the inner { lock_guard } scope above (closed before this point), so the
+        // blocking sched_token_reacquire_after_wait() here runs with NO object
+        // mutex held — it satisfies the F1 invariant as-is (no change needed; the
+        // park is a host sleep_for, not a cv-wait under the object mutex).
         sched_token_release_for_wait();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         sched_token_reacquire_after_wait();
