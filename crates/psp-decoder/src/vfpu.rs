@@ -568,6 +568,56 @@ pub(crate) fn decode_vfpu5(
 // VFPU6 (opcode 0x3C): matrix ops
 // -------------------------------------------------------------------------
 
+/// Decode a VFPU6 transform op (`vtfm`N / `vhtfm`N) by size relationship.
+///
+/// `ins` is the table group `(word>>23)&7` (1=>tfm2, 2=>tfm3, 3=>tfm4) and
+/// `n` is the operand vector size from the size bits. PPSSPP `Dis_Vtfm`
+/// chooses the homogeneous form (`vhtfm`N) when `n == ins` and the plain
+/// form (`vtfm`N) when `n == ins+1`; any other relationship is invalid.
+/// The emitted size is always `n` (the printed `vtfm`N / `vhtfm`N digit).
+///
+/// Args:
+///   word: The full 32-bit instruction word (for the unknown fallback).
+///   vaddr: The instruction's virtual address (for the unknown fallback).
+///   ins: The transform table group `(word>>23)&7`, one of 1, 2 or 3.
+///   d: Decoded VD register field.
+///   s: Decoded VS register field.
+///   t: Decoded VT register field.
+///
+/// Returns:
+///   `VfpuTfm` / `VfpuHtfm` with `size = n`, or `VfpuUnknown` for a bad
+///   size relationship.
+fn decode_tfm(
+    word: u32,
+    vaddr: u32,
+    ins: u32,
+    d: u8,
+    s: u8,
+    t: u8,
+) -> Result<MipsOp, DecodeError> {
+    let n = vec_size(word) as u32;
+    if n == ins {
+        Ok(MipsOp::VfpuHtfm {
+            vd: d,
+            vs: s,
+            vt: t,
+            size: n as u8,
+        })
+    } else if n == ins + 1 {
+        Ok(MipsOp::VfpuTfm {
+            vd: d,
+            vs: s,
+            vt: t,
+            size: n as u8,
+        })
+    } else {
+        Ok(MipsOp::VfpuUnknown {
+            opcode: word,
+            pc: vaddr,
+        })
+    }
+}
+
 /// Decode VFPU6 group (opcode 0x3C).
 ///
 /// Complex sub-dispatch via bits 25:21 for matrix operations.
@@ -591,99 +641,21 @@ pub(crate) fn decode_vfpu6(
                 size: sz,
             })
         }
-        1 => {
-            // vtfm / vhtfm, distinguished by sub-bits
-            let sub21 = (word >> 21) & 3;
-            match sub21 {
-                0 => Ok(MipsOp::VfpuMscl {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: sz,
-                }),
-                _ => Ok(MipsOp::VfpuUnknown {
-                    opcode: word,
-                    pc: vaddr,
-                }),
-            }
-        }
-        2 => {
-            // vtfm2/vhtfm2 or crsp based on sub-bits
-            let sub21 = (word >> 21) & 3;
-            match sub21 {
-                0 => Ok(MipsOp::VfpuHtfm {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: 2,
-                }),
-                1 => Ok(MipsOp::VfpuTfm {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: 2,
-                }),
-                _ => Ok(MipsOp::VfpuUnknown {
-                    opcode: word,
-                    pc: vaddr,
-                }),
-            }
-        }
-        3 => {
-            // vtfm3/vhtfm3 or crsp
-            let sub21 = (word >> 21) & 3;
-            match sub21 {
-                0 => Ok(MipsOp::VfpuHtfm {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: 3,
-                }),
-                1 => Ok(MipsOp::VfpuTfm {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: 3,
-                }),
-                2 => Ok(MipsOp::VfpuCrsp {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: sz,
-                }),
-                _ => Ok(MipsOp::VfpuUnknown {
-                    opcode: word,
-                    pc: vaddr,
-                }),
-            }
-        }
+        // PPSSPP tableVFPU6 indices 4-15 (sub=1,2,3): v(h)tfm2/3/4.
+        // The vtfm/vmscl block had been rotated by one slot vs PPSSPP
+        // `tableVFPU6` (sub=1 mis-mapped to vmscl, etc.); the correct
+        // layout puts the transform groups at sub=1,2,3 and vmscl at
+        // sub=4. decode_tfm resolves vtfm-vs-vhtfm from the size bits,
+        // not the rt field (mirrors PPSSPP `Dis_Vtfm`).
+        1..=3 => decode_tfm(word, vaddr, sub, d, s, t),
         4 => {
-            // vtfm4/vhtfm4 or qmul
-            let sub21 = (word >> 21) & 3;
-            match sub21 {
-                0 => Ok(MipsOp::VfpuHtfm {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: 4,
-                }),
-                1 => Ok(MipsOp::VfpuTfm {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: 4,
-                }),
-                2 => Ok(MipsOp::VfpuCrsp {
-                    vd: d,
-                    vs: s,
-                    vt: t,
-                    size: sz,
-                }),
-                _ => Ok(MipsOp::VfpuUnknown {
-                    opcode: word,
-                    pc: vaddr,
-                }),
-            }
+            // PPSSPP tableVFPU6 indices 16-19: vmscl (matrix scale).
+            Ok(MipsOp::VfpuMscl {
+                vd: d,
+                vs: s,
+                vt: t,
+                size: sz,
+            })
         }
         5 => {
             // PPSSPP tableVFPU6 indices 20-23: vcrsp.t/vqmul.q
@@ -1107,6 +1079,90 @@ mod tests {
         match op {
             MipsOp::VfpuCrsp { .. } => {}
             _ => panic!("Expected VfpuCrsp, got {op:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // VFPU6 vtfm/vmscl slot-rotation + vtfm/vhtfm size-split regression
+    // (issue #27/#67). The vtfm/vmscl dispatch block was rotated by one
+    // slot vs PPSSPP `tableVFPU6` (sub=1->vmscl, 2->vtfm2, 3->vtfm3,
+    // 4->vtfm4) so the engine matrix builder emitted ZERO plain vtfm and
+    // ZERO vmscl game-wide -- every real vtfm decoded as vhtfm. Words are
+    // captured from the live Patapon image (relocated segment in
+    // analysis.json); see `.planning/research/pin-verification.md`.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_vfpu6_vmmul_unchanged() {
+        // 0xF02488A0 @ 0x088337A8 (sub=0). Brackets the rotated block.
+        match decode_vfpu6(0xF02488A0, 0x088337A8).unwrap() {
+            MipsOp::VfpuMmul { vd, vs, vt, size } => {
+                assert_eq!((vd, vs, vt, size), (0x20, 0x08, 0x24, 4));
+            }
+            other => panic!("expected vmmul, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_vfpu6_vtfm2() {
+        // 0xF0914991 @ 0x089FA424 (sub=1, n=2, n==ins+1 -> vtfm2).
+        // Pre-fix this decoded as vmscl (the rotation).
+        match decode_vfpu6(0xF0914991, 0x089FA424).unwrap() {
+            MipsOp::VfpuTfm { vd, vs, vt, size } => {
+                assert_eq!((vd, vs, vt, size), (0x11, 0x49, 0x11, 2));
+            }
+            other => panic!("expected vtfm2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_vfpu6_vtfm3() {
+        // 0xF108A400 @ 0x08855468 (sub=2, n=3, n==ins+1 -> vtfm3).
+        // Pre-fix this decoded as vhtfm2.
+        match decode_vfpu6(0xF108A400, 0x08855468).unwrap() {
+            MipsOp::VfpuTfm { vd, vs, vt, size } => {
+                assert_eq!((vd, vs, vt, size), (0x00, 0x24, 0x08, 3));
+            }
+            other => panic!("expected vtfm3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_vfpu6_vtfm4() {
+        // 0xF18BA483 @ 0x08834144 (sub=3, n=4, n==ins+1 -> vtfm4).
+        // Pre-fix this decoded as vhtfm3 -- the exact builder mis-route
+        // behind the WORLD -90 deg fingerprint.
+        match decode_vfpu6(0xF18BA483, 0x08834144).unwrap() {
+            MipsOp::VfpuTfm { vd, vs, vt, size } => {
+                assert_eq!((vd, vs, vt, size), (0x03, 0x24, 0x0B, 4));
+            }
+            other => panic!("expected vtfm4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_vfpu6_vhtfm3_size_split() {
+        // 0xF180AC01 @ 0x08857B8C (sub=3, n=3, n==ins -> vhtfm3). A
+        // GENUINE homogeneous transform: the size-split keeps it vhtfm
+        // while its sibling 0xF18BA483 (n=4) becomes vtfm4. This is the
+        // real builder word that fired the live "vhtfm3" emit.
+        match decode_vfpu6(0xF180AC01, 0x08857B8C).unwrap() {
+            MipsOp::VfpuHtfm { vd, vs, vt, size } => {
+                assert_eq!((vd, vs, vt, size), (0x01, 0x2C, 0x00, 3));
+            }
+            other => panic!("expected vhtfm3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_vfpu6_vmscl() {
+        // 0xF208A4A0 @ 0x088554FC (sub=4 -> vmscl). Pre-fix this decoded
+        // as vhtfm4; zero vmscl were emitted game-wide before the fix.
+        match decode_vfpu6(0xF208A4A0, 0x088554FC).unwrap() {
+            MipsOp::VfpuMscl { vd, vs, vt, size } => {
+                assert_eq!((vd, vs, vt, size), (0x20, 0x24, 0x08, 4));
+            }
+            other => panic!("expected vmscl, got {other:?}"),
         }
     }
 
