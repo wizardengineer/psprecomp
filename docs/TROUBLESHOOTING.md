@@ -26,8 +26,9 @@ that VFPU-complete language; without the extension you get wrong/garbage analysi
 `analyze` checks for the *extension* (not just the SLEIGH module) and **warns** if it can't
 locate it (issue #75). It does **not** hard-block: detection is heuristic — the extension can
 live in the install tree or a per-user settings dir, and its loader is packaged inside a jar —
-so a false block would be worse than a warning. The downstream per-block byte-equality gate
-hard-fails loudly if the wrong language was actually used.
+so a false block would be worse than a warning. (Note: the byte-equality gate guards
+*relocation*, not instruction decode, so it does not catch a stock-Allegrex VFPU mis-decode —
+installing the extension is the real fix; this warning is the safeguard.)
 
 **Symptom** (printed to stderr; analysis still runs)
 
