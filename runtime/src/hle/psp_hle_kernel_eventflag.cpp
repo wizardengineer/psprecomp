@@ -161,7 +161,12 @@ static void hle_sceKernelWaitEventFlag(
     uint32_t wait_mode = static_cast<uint32_t>(ctx->r[6]);
     uint32_t out_bits_ptr = static_cast<uint32_t>(ctx->r[7]);
 
-    sched_yield_point();
+    // [F2] OFF: leading cooperative yield (unchanged, byte-identical). ON: skip
+    // it — the sched_token_release_for_wait() below is the sole hand-off for the
+    // parking path.
+    if (!sched_token_enabled()) {
+        sched_yield_point();
+    }
 
     auto it = g_eventflags.find(uid);
     if (it == g_eventflags.end()) {
@@ -187,9 +192,38 @@ static void hle_sceKernelWaitEventFlag(
     // Waiter census for sceKernelReferEventFlagStatus's numWaitThreads
     // (read-side bookkeeping only — no control-flow change).
     ef->num_wait_threads++;
-    bool matched = ef->cv.wait_for(lock, std::chrono::seconds(5), [&] {
+    // Single-runnable token (PSPRECOMP_PREEMPT): release the run-token to a
+    // peer before parking on the event-flag condvar, reclaim it on wake.
+    // No-op when the flag is OFF (byte-identical default path).
+    //
+    // [F1] Un-nest the blocking token re-acquire from under ef->mtx: park on the
+    // cv under ef->mtx, then drop ef->mtx -> reacquire the token -> re-take
+    // ef->mtx (sched_token_reacquire_unlocked), and re-evaluate the pattern in a
+    // loop (the pattern may have changed while ef->mtx was dropped). Otherwise a
+    // consumer parked here would strand ef->mtx in token_acquire and the CriCond
+    // producer's SetEventFlag would block on ef->mtx — the AB-BA livelock. The
+    // 5s valve is unchanged. OFF: sched_token_reacquire_unlocked is a no-op, so
+    // ef->mtx is held across exactly the original single cv.wait_for and the loop
+    // runs once with the same `matched` result (byte-identical).
+    auto evf_ready = [&] {
         return pattern_matches(ef->pattern, bits, wait_mode);
-    });
+    };
+    sched_token_release_for_wait();
+    bool matched = false;
+    while (!g_should_exit.load()) {
+        matched = ef->cv.wait_for(lock, std::chrono::seconds(5), evf_ready);
+        sched_token_reacquire_unlocked(lock);  // [F1] no ef->mtx held in the block
+        matched = evf_ready();  // [F1] re-check after the dropped-mutex window
+        if (matched) {
+            break;
+        }
+        if (!sched_token_enabled()) {
+            break;  // OFF: single wait_for then return on timeout — byte-identical.
+        }
+        // ON: a spurious wake / dropped-mutex churn left the pattern unmatched;
+        // re-park (release the token again) and wait for the real Set/Cancel.
+        sched_token_release_for_wait();
+    }
     ef->num_wait_threads--;
     auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - wait_start).count();

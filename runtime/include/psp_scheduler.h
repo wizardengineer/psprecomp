@@ -50,11 +50,17 @@ static constexpr int SCHED_TIMEOUT_MS = 50;
 /// points (#66, design approach (a)). The emitter decrements
 /// `ctx->preempt_budget` once per loop back-edge pass; when it reaches <= 0 the
 /// generated code calls `sched_preempt()`, which reloads it to this value. This
-/// is a generic, title-agnostic constant (purity gate): ~100k back-edge passes
+/// is a generic, title-agnostic constant (purity gate): ~20k back-edge passes
 /// between reschedule checks keeps the dead-effect counter overhead negligible
 /// on straight-line-dominated code while bounding how long a syscall-free spin
 /// runs before reaching a preemption point once the flag is enabled.
-static constexpr int32_t SCHED_PREEMPT_BUDGET = 100000;
+///
+/// [approach (d) perf pass, F4] 100000 -> 20000. After F3 makes a sole-runnable
+/// hand-off ~free, the budget's only remaining job ON is to bound producer-
+/// wakeup latency when a peer un-parks; 20k gives 5x finer granularity at
+/// negligible cost (one 64-slot scan per 20k back-edges). OFF this only changes
+/// the numeric constant written to ctx->preempt_budget; it still never yields.
+static constexpr int32_t SCHED_PREEMPT_BUDGET = 20000;
 
 /// Per-thread state for PSP cooperative scheduler.
 /// Each thread gets its own recomp_context (RUNTIME-01) so register state
@@ -75,6 +81,23 @@ struct PspThread {
     char name[32];              ///< Thread name for debugging
     char wait_reason[24];       ///< Why the thread is blocked (e.g. "sema:259",
                                 ///< "sleep"); diagnostics only, racy reads OK
+    bool token_parked = false;  ///< [approach (d)] This thread released the
+                                ///< run-token and is parked (on its own cv or a
+                                ///< foreign object cv) — NOT eligible to receive
+                                ///< the token until it re-contends. Guarded by
+                                ///< g_sched_mutex. Unused when PSPRECOMP_PREEMPT
+                                ///< is OFF.
+    uint64_t token_last_ran = 0; ///< [F2-core] Monotonic stamp = the value of
+                                 ///< g_token_grant_seq at the moment this thread
+                                 ///< was last GRANTED the token. Used by
+                                 ///< select_next_runnable as the within-priority
+                                 ///< tiebreak: least-recently-ran (smallest stamp)
+                                 ///< wins, so a just-yielded holder is demoted and
+                                 ///< a freshly-un-parked starved peer is picked
+                                 ///< first. Written/read ONLY on the ON path
+                                 ///< (token_enabled()); guarded by g_sched_mutex.
+                                 ///< Stays 0 forever when PSPRECOMP_PREEMPT is OFF
+                                 ///< (OFF byte-identical).
 };
 
 /// Initialize scheduler — zero all 64 thread slots.
@@ -109,6 +132,43 @@ void sched_yield_point();
 /// path reuses `sched_yield_point()`). Always resets the budget so the spin loop
 /// does not call back every iteration.
 void sched_preempt(recomp_context* ctx);
+
+/// Single-runnable token hand-off helpers (approach (d), PSPRECOMP_PREEMPT).
+/// HLE wait stubs that park the CURRENT thread on their OWN object condvar
+/// (event-flag `ef->cv`, sema `s->cv`) — i.e. NOT through the scheduler's
+/// WAIT path — must release the run-token to a runnable peer before parking and
+/// re-acquire it after waking, or guest execution stalls under the flag. Both
+/// are NO-OPS when PSPRECOMP_PREEMPT is unset (default), so the OFF path is
+/// byte-identical. Call `sched_token_release_for_wait()` immediately before the
+/// object-cv `wait_for`, and `sched_token_reacquire_after_wait()` immediately
+/// after it returns. These take the scheduler mutex internally and must NOT be
+/// called while it is already held.
+void sched_token_release_for_wait();
+void sched_token_reacquire_after_wait();
+
+/// [F1] Un-nested blocking token re-acquire — the ONLY safe way to re-take the
+/// run-token after an object-cv park. INVARIANT (load-bearing): the blocking
+/// token re-acquire must run with NO object/render mutex held, else a thread can
+/// strand the object mutex while parked in token_acquire and form an AB-BA
+/// deadlock with the producer that needs that mutex (the PREEMPT=1 GE/CRI-ring
+/// livelock). This helper enforces it: it UNLOCKS the caller's object lock,
+/// re-acquires the token (with the object mutex dropped), then RE-LOCKS the
+/// object lock — so on return the caller holds the object mutex again and MUST
+/// re-check its wait predicate (state may have changed while the mutex was
+/// dropped). It is a literal NO-OP when PSPRECOMP_PREEMPT is OFF: the lock is
+/// never unlocked/relocked and `lock` is returned untouched (OFF byte-identical,
+/// zero extra mutex ops). Replaces a bare sched_token_reacquire_after_wait()
+/// that was called while the object lock was still held. `lock` MUST own its
+/// mutex on entry.
+void sched_token_reacquire_unlocked(std::unique_lock<std::mutex>& lock);
+
+/// Public predicate: is the single-runnable run-token engaged (PSPRECOMP_PREEMPT
+/// set)? Forwards to the cached internal token_enabled(); the single public face
+/// of that one source of truth. Used by HLE wait stubs (approach (d) perf pass)
+/// to gate ON-only timeout cadences (e.g. WaitSemaCB) and to skip the redundant
+/// leading sched_yield_point() before an object-cv park (F2). Returns false (so
+/// every gated branch is the OFF/legacy path) when the flag is unset.
+bool sched_token_enabled();
 
 /// Mark current thread DEAD, decrement g_alive_threads, wake next thread.
 void psp_thread_exit_current();

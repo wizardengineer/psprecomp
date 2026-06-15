@@ -51,9 +51,26 @@ void render_queue_post(RenderRequest& req) {
 
     g_render_cv.notify_one();
 
+    // [M1.e] Single-runnable token (PSPRECOMP_PREEMPT): this runs on a PSP guest
+    // thread (g_current != null) that blocks on the GE/GL present round-trip.
+    // Release the run-token to a peer for the duration of the wait, reclaim on
+    // wake — otherwise a PSP thread blocked on the whole-frame present would
+    // starve every peer of the token (and a token-mediated GE deadlock). No-op
+    // when OFF (byte-identical) and when called from a non-PSP thread.
+    sched_token_release_for_wait();
     g_render_cv.wait(lock, [] {
         return g_render_req.done || g_should_exit.load();
     });
+    // [F1] Un-nest the blocking token re-acquire from under g_render_mutex: drop
+    // it -> token_acquire -> re-take (sched_token_reacquire_unlocked). The wait
+    // predicate (g_render_req.done) is already satisfied and monotonic, so no
+    // re-check is needed; the function returns immediately after. Without un-
+    // nesting, a PSP thread parked in token_acquire would strand g_render_mutex
+    // and the main render thread's render_queue_process (which takes g_render_
+    // mutex) would block on it. OFF: sched_token_reacquire_unlocked is a no-op,
+    // so g_render_mutex is held across exactly the original wait (byte-identical),
+    // and on a non-PSP thread (g_current == null) it is also a no-op.
+    sched_token_reacquire_unlocked(lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +141,25 @@ int render_queue_draw_sync(int mode) {
         // Blocking: wait until all GE lists are drained (500ms safety valve).
         // Timeout prevents infinite hang when a list is stalled with no
         // further UpdateStallAddr call (e.g. uid mismatch or lost list).
+        // [M1.e] This runs on a PSP guest thread blocking on the GE round-trip;
+        // release the run-token to a peer across the wait, reclaim on wake, so a
+        // thread blocked on DrawSync/ListSync FREES the token to peers (fixes a
+        // token-mediated GE deadlock + whole-GL-frame token starvation). The
+        // leading sched_yield_point() at function entry stays (not an object-cv
+        // park gate). No-op when OFF (byte-identical) and on non-PSP threads.
+        sched_token_release_for_wait();
         bool drained = g_ge_done_cv.wait_for(lock,
             std::chrono::milliseconds(500),
             [] { return g_ge_queue.empty() || g_should_exit.load(); });
+        // [F1] Un-nest the blocking token re-acquire from under g_render_mutex:
+        // drop it -> token_acquire -> re-take (sched_token_reacquire_unlocked).
+        // `drained` was decided under the lock and is only used for a log below;
+        // the 500ms valve result stands (no re-check needed). Without un-nesting,
+        // a PSP thread parked in token_acquire would strand g_render_mutex and the
+        // render thread's render_queue_process would block on it. OFF: no-op
+        // (g_render_mutex held across exactly the original wait, byte-identical);
+        // non-PSP thread: also a no-op.
+        sched_token_reacquire_unlocked(lock);
         if (!drained) {
             std::fprintf(stderr,
                 "[GE] DrawSync timeout: %zu lists still pending\n",
@@ -155,6 +188,13 @@ bool render_queue_has_pending_ge() {
 // ---------------------------------------------------------------------------
 // render_queue_process -- main thread: drain both paths
 // ---------------------------------------------------------------------------
+// [M1.e DEFERRED] render_queue_process runs on the MAIN (render) thread, where
+// g_current == null, so the token helpers are no-ops here by design — bracketing
+// would be wrong (a non-token thread must not take g_sched_mutex for token ops).
+// A separate residual concern: if the GE finish/signal callback fired from this
+// path were itself to block, that block happens on the main thread and is NOT
+// covered by the M1.e PSP-thread wiring above. That is a separate DEFERRED
+// concern, not addressed in this perf pass.
 void render_queue_process() {
     std::unique_lock<std::mutex> lock(g_render_mutex);
 
