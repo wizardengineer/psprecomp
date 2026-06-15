@@ -27,6 +27,7 @@ the PSP Graphics Engine to OpenGL 3.3.
 - [Quickstart](#quickstart)
 - [Supported games](#supported-games)
 - [Current Status](#current-status)
+- [Roadmap](#roadmap)
 - [Building and Running](#building-and-running)
 - [Verification Methodology](#verification-methodology)
 - [Limitations](#limitations)
@@ -154,24 +155,66 @@ The single platform is macOS — see [Limitations](#limitations) and
 
 ## Current Status
 
-**As of 2026-06-10: the game boots and renders the PATAPON title screen** — logo, NEW
-GAME/CONTINUE menu, and copyright text, visually matching PPSSPP. This is the first real graphics
-the runtime has displayed; earlier rendering milestones were measured in display-list metrics
-only.
+**The runtime boots Patapon and renders its title screen** — the PATAPON logo, the NEW
+GAME/CONTINUE menu, and copyright text, visually matching PPSSPP. This is the public baseline: it
+builds reproducibly and reaches the title **deterministically** (fresh recompile +
+`PSPRECOMP_CLEANROOM=1`), with no per-game hacks in the runtime core.
 
 ![PATAPON title screen rendered by psprecomp_runtime](docs/title-screen.png)
 
-Recent work that got it there (merged via PR #17):
+How it got here:
 
-- **Faithful IO HLE** — PPSSPP-exact rejection of NULL/empty `sceIoOpen` paths, a file-descriptor
-  cap, and `BADF` errors; fixed a leak of ~159,000 fds during boot.
-- **Emitter fix** — the FPU integer and float register views (`f[]`/`fi[]`) now alias via an
-  anonymous union; previously every `lwc1`-fed float computation in the binary was a no-op.
-- **GE SIGNAL flow control** — display-list JUMP/CALL/RET behaviors (0x10–0x12); Patapon keeps
-  all real geometry in SIGNAL-called sub-lists, all of which were previously skipped.
-- **Renderer fixes** — CLUT palette addressing (palettes were read from zeroed RAM, making all
-  texels transparent) and column-major PSP matrix layout in the vertex transform (vertices
-  previously collapsed to a point).
+- **Function discovery + faithful HLE** — the Ghidra census is supplemented with mid-entry and
+  cross-jump recovery; IO HLE matches PPSSPP (path rejection, fd cap, `BADF`), the `f[]`/`fi[]`
+  FPU register views alias correctly, and GE SIGNAL flow control runs the sub-lists Patapon keeps
+  all of its real geometry in.
+- **Correct geometry** — GE present on guest page-flip with an address-keyed FBO pool (#59), PSP
+  viewport/depth mapping (#23), and the VFPU decode-rotation + per-op matrix-prefix fixes
+  (#27/#67) that make the transform matrices correct.
+- **Reproducible + onboardable** — byte-reproducible recompiles guarded by a build fingerprint, a
+  pinned Ghidra + ghidra-allegrex toolchain, Rust-workspace CI, and the [docs](#documentation)
+  below.
+
+See the [Roadmap](#roadmap) for where this is going next.
+
+## Roadmap
+
+**Goal:** drive Patapon — and then a second title — to *playable* using only generic fixes (no
+per-game hacks in the runtime core), verified against PPSSPP, while keeping the public baseline
+stable and the project easy to build and extend. Progress is tracked in the
+[issue tracker](https://github.com/wizardengineer/psprecomp/issues); `area:` and `severity:`
+labels mark scope and priority.
+
+**Done**
+
+- [x] Boot Patapon to a rendered, deterministic title screen (the public baseline).
+- [x] Correct GE present + VFPU transform matrices (#59, #23, #27/#67).
+- [x] Byte-reproducible recompiles with a build-staleness fingerprint.
+- [x] Onboarding/DX — pinned Ghidra toolchain + fixed install check (#75); env-flag,
+      troubleshooting, platform, and adding-a-game docs; a `games/TEMPLATE/` skeleton; and
+      Rust-workspace CI.
+
+**Next — make Patapon playable** (tracked in #73; the through-line is scheduler faithfulness, #66)
+
+- [ ] Activate and present the title menu: hand the cooperative scheduler's run-token to the asset
+      loader so the menu state machine advances (#66), then present the drawn back-buffer without
+      stalling the render queue.
+- [ ] Test and wire menu input — cursor navigation and committing NEW GAME.
+- [ ] Reach the new-game load, past the gates that currently block it: the SAS audio handshake
+      (#29) and the PSMF intro stubs (#32).
+- [ ] Remove the temporary degenerate-matrix fallback and render through the real 3D transform
+      (#27/#67); the fallback is 2D-only and hardcodes Patapon's viewport.
+
+**Beyond the title — broader goals**
+
+- [ ] Audio: real ATRAC/SAS decode and a periodic audio IRQ / buffer drain (#29).
+- [ ] GE/render fidelity: block transfers (#21), texture sampling (#22), the per-fragment pipeline
+      (#24), 3D features — lighting / skinning / patches (#25), and display-list gaps (#26).
+- [ ] Faithful kernel callback delivery (#11) and the event-flag wait-mode fix (#64).
+- [ ] Second game: drive `.hack//Link` past its loading wall (#63) and generalize the runtime for
+      more titles.
+- [ ] Cross-platform: build and verify on Linux and Windows (#70 — see
+      [docs/PLATFORMS.md](docs/PLATFORMS.md)).
 
 ## Building and Running
 
@@ -227,9 +270,11 @@ curl -L -o /tmp/allegrex.zip \
 #    (Or unzip into "$GHIDRA_DIR/Ghidra/Extensions/" and restart.)
 ```
 
-The analyze step verifies the Allegrex processor module is present and refuses to run without it.
-Pass the install to `analyze` with `--ghidra-dir` (Homebrew: `"$(brew --prefix ghidra)/libexec"`;
-manual unzip: the directory containing `support/analyzeHeadless`, with no `libexec`).
+The analyze step checks for the ghidra-allegrex extension and **warns** if it can't locate it
+(detection is heuristic, so it does not hard-block — see
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)). Pass the install to `analyze` with
+`--ghidra-dir` (Homebrew: `"$(brew --prefix ghidra)/libexec"`; manual unzip: the directory
+containing `support/analyzeHeadless`, with no `libexec`).
 
 You must also provide, from your own copy of the game (no game data is included in or
 distributed with this repository):
