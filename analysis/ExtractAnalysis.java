@@ -1,6 +1,8 @@
 // Exports function boundaries, xrefs, and constructor tables from a PSP binary.
 // Run as: analyzeHeadless ... -postScript ExtractAnalysis.java /path/to/output.json
-// Requires: ghidra-allegrex v21.2 installed in GHIDRA_INSTALL_DIR/Ghidra/Processors/
+// Requires: ghidra-allegrex v21.3 (Ghidra 12.0.2 build), installed under
+//           GHIDRA_INSTALL_DIR/Ghidra/Extensions/ (unzip) or the Ghidra user-settings
+//           Extensions dir (GUI: File -> Install Extensions).
 //@category PSPrecomp
 
 import ghidra.app.script.GhidraScript;

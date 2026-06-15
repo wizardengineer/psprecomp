@@ -4,12 +4,14 @@
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use psp_parser::analysis_json::{JsonFunction, JsonMidEntry, JsonXref};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Invoke Ghidra headless analysis and write raw JSON to `output`.
 ///
-/// Verifies that the ghidra-allegrex plugin is installed before running.
+/// Checks for the kotcrab ghidra-allegrex extension and warns if it can't be
+/// located (detection is heuristic); it hard-fails only when no Allegrex
+/// language is present at all — see `check_allegrex_extension`.
 /// For relocatable PRX inputs, `prx_base` pins the loader and image base
 /// (`-loader PspElfLoader -loader-imagebase <hex>`) so ghidra-allegrex
 /// rebases + relocates the image natively (plan D1); `None` (ET_EXEC) keeps
@@ -20,17 +22,9 @@ pub fn run_ghidra_analysis(
     output: &Path,
     prx_base: Option<u32>,
 ) -> Result<()> {
-    // Verify plugin is installed
-    let plugin_dir = ghidra_dir.join("Ghidra/Processors/Allegrex");
-    if !plugin_dir.exists() {
-        bail!(
-            "ghidra-allegrex plugin not found at {}\n\
-             Install it: copy the Allegrex/ directory from the ghidra-allegrex ZIP \
-             into {}/Ghidra/Processors/",
-            plugin_dir.display(),
-            ghidra_dir.display()
-        );
-    }
+    // Issue #75: warn (don't false-block) when the ghidra-allegrex extension
+    // can't be located; hard-fail only when no Allegrex language is present.
+    check_allegrex_extension(ghidra_dir)?;
 
     // Locate ExtractAnalysis.java relative to the binary
     let script = find_analysis_script()?;
@@ -82,6 +76,109 @@ pub fn run_ghidra_analysis(
         bail!("Ghidra headless failed with exit code {:?}", status.code());
     }
     Ok(())
+}
+
+/// Verify the Allegrex tooling Ghidra will use, with DX-safe failure modes.
+///
+/// Detection of the kotcrab extension is heuristic (it can live in the install
+/// tree or a per-user Ghidra settings dir, and its loader is packaged inside a
+/// jar), so a miss is a loud WARNING rather than a hard error — false-blocking a
+/// correctly-configured user is worse than the original issue-#75 silent pass,
+/// and the downstream per-block byte-equality gate hard-fails if the wrong
+/// language was actually used. A hard error is reserved for "no Allegrex
+/// language present at all", where Ghidra cannot produce usable output.
+fn check_allegrex_extension(ghidra_dir: &Path) -> Result<()> {
+    if allegrex_extension_installed(ghidra_dir) {
+        return Ok(());
+    }
+    if !stock_allegrex_present(ghidra_dir) {
+        bail!(
+            "No Allegrex processor found under {} — is --ghidra-dir pointing at a valid \
+             Ghidra install (its libexec dir)? Install Ghidra 12.0.2 PUBLIC + the \
+             ghidra-allegrex v21.3 extension (asset \
+             ghidra_12.0.2_PUBLIC_20260310_ghidra-allegrex.zip) — see README.",
+            ghidra_dir.join("Ghidra/Processors/Allegrex").display()
+        );
+    }
+    eprintln!(
+        "warning: kotcrab ghidra-allegrex extension not detected under {} or your Ghidra \
+         user-settings Extensions dir.\n  \
+         Stock Ghidra's bundled Allegrex lacks the PspElfLoader + VFPU-complete language \
+         this pipeline requires; analysis may be incorrect. Install ghidra-allegrex v21.3 \
+         (Ghidra 12.0.2 build), asset ghidra_12.0.2_PUBLIC_20260310_ghidra-allegrex.zip, \
+         from https://github.com/kotcrab/ghidra-allegrex/releases/tag/v21.3 — see README.\n  \
+         If you installed it via the Ghidra GUI this check may not see it and you can \
+         ignore this warning; the per-block byte-equality gate hard-fails if the wrong \
+         language was actually used.",
+        ghidra_dir.join("Ghidra/Extensions").display()
+    );
+    Ok(())
+}
+
+/// True when the kotcrab ghidra-allegrex extension is installed for `ghidra_dir`.
+///
+/// Scans both the install tree (`<ghidra_dir>/Ghidra/Extensions/`, flat) and the
+/// per-user Ghidra settings dirs the GUI "Install Extensions" flow writes to —
+/// `--ghidra-dir` points only at the install tree, so a GUI install would
+/// otherwise be invisible.
+fn allegrex_extension_installed(ghidra_dir: &Path) -> bool {
+    extension_search_roots(ghidra_dir)
+        .iter()
+        .any(|root| root_has_allegrex(root))
+}
+
+/// Extension directories to scan: the install tree plus any per-user Ghidra
+/// settings dir (`$GHIDRA_USER_DIR/Extensions`, `~/.ghidra/.ghidra_<ver>/Extensions`).
+fn extension_search_roots(ghidra_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![ghidra_dir.join("Ghidra/Extensions")];
+    if let Ok(user_dir) = std::env::var("GHIDRA_USER_DIR") {
+        roots.push(Path::new(&user_dir).join("Extensions"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(entries) = std::fs::read_dir(Path::new(&home).join(".ghidra")) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with(".ghidra_") {
+                    roots.push(e.path().join("Extensions"));
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// True when `root` holds an extension dir whose name contains "allegrex" (the
+/// reliable signal) or that carries a `PspElfLoader` marker (best-effort — the
+/// loader usually lives inside a jar, so this mainly catches unpacked installs).
+fn root_has_allegrex(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && (e.file_name().to_string_lossy().to_lowercase().contains("allegrex")
+                || dir_has_pspelfloader(&e.path()))
+    })
+}
+
+/// True when stock Ghidra's bundled Allegrex SLEIGH module is present. Stock
+/// Ghidra ships this without the extension's PspElfLoader/VFPU completeness, so
+/// presence alone does NOT satisfy the extension check — it only distinguishes
+/// "extension missing" (warn) from "no Allegrex at all" (hard error).
+fn stock_allegrex_present(ghidra_dir: &Path) -> bool {
+    ghidra_dir.join("Ghidra/Processors/Allegrex").is_dir()
+}
+
+/// True when `dir` (one extension) contains a `PspElfLoader` marker file.
+fn dir_has_pspelfloader(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("pspelfloader")
+    })
 }
 
 /// Find ExtractAnalysis.java relative to the executable or in `$PWD/analysis/`.
@@ -726,6 +823,61 @@ mod tests {
         // Missing sidecar: invalid.
         assert!(!ghidra_cache_valid(&dir.join("missing.json"), &same));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stock_only_tree_is_not_detected_as_extension() {
+        // Issue #75: stock Ghidra 12.x ships Processors/Allegrex but NOT the
+        // kotcrab extension. The stock module must NOT satisfy the extension
+        // check (that was the false-positive), yet must be recognized as "some
+        // Allegrex present" so the policy warns rather than hard-errors.
+        let root = tempfile::tempdir().unwrap();
+        let g = root.path();
+        std::fs::create_dir_all(g.join("Ghidra/Processors/Allegrex/data/languages")).unwrap();
+        assert!(stock_allegrex_present(g));
+        assert!(
+            !allegrex_extension_installed(g),
+            "stock Processors/Allegrex must not satisfy the extension check"
+        );
+    }
+
+    #[test]
+    fn extension_at_real_flat_path_is_detected() {
+        // A genuine install unzips FLAT to <ghidra>/Ghidra/Extensions/<name>/,
+        // NOT nested under a second Ghidra/ — guards the false-negative bug.
+        let root = tempfile::tempdir().unwrap();
+        let g = root.path();
+        let ext = g.join("Ghidra/Extensions/ghidra_12.0.2_PUBLIC_20260310_ghidra-allegrex");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("Module.manifest"), b"").unwrap();
+        assert!(
+            allegrex_extension_installed(g),
+            "flat Extensions/<...allegrex> must be detected"
+        );
+    }
+
+    #[test]
+    fn pspelfloader_marker_detects_oddly_named_extension() {
+        // An extension dir whose name lacks "allegrex" still passes when it
+        // carries the pinned PspElfLoader marker (best-effort fallback).
+        let root = tempfile::tempdir().unwrap();
+        let g = root.path();
+        let ext = g.join("Ghidra/Extensions/some-psp-ext");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("PspElfLoader.class"), b"").unwrap();
+        assert!(allegrex_extension_installed(g));
+    }
+
+    #[test]
+    fn user_settings_extensions_dir_is_scanned() {
+        // GUI "Install Extensions" unzips into ~/.ghidra/.ghidra_<ver>/Extensions
+        // (or $GHIDRA_USER_DIR/Extensions), not the install tree that
+        // --ghidra-dir points at. root_has_allegrex must accept it. (Tested via
+        // the per-root helper to avoid mutating process env in parallel tests.)
+        let root = tempfile::tempdir().unwrap();
+        let user_ext = root.path().join(".ghidra/.ghidra_12.0.2_PUBLIC/Extensions");
+        std::fs::create_dir_all(user_ext.join("ghidra-allegrex")).unwrap();
+        assert!(root_has_allegrex(&user_ext));
     }
 
     #[test]
