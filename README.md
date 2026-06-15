@@ -5,9 +5,11 @@ and a C++17 runtime (SDL2 + OpenGL 3.3) executes the result with HLE implementat
 OS services. The target binary is **Patapon (USA) BOOT.BIN**.
 
 > [!WARNING]
-> **One game only.** This project has been developed and verified against exactly one binary —
-> Patapon (USA). HLE semantics, renderer fallbacks, and asset handling may be specific to it;
-> other PSP games will most likely not work without additional effort.
+> **One game verified, not one game hardcoded.** The runtime core is game-agnostic — all
+> Patapon-specific code lives in `games/patapon/` behind compile-time seams. But exactly one
+> binary, **Patapon (USA)**, has been driven all the way to rendered graphics. HLE coverage,
+> renderer fallbacks, and asset handling are exercised only as far as that title needs them, so
+> other PSP games will most likely need additional work. See [Supported games](#supported-games).
 >
 > **Vibe coded.** The codebase is largely AI-generated (Claude). Every change is verified by
 > running the game and diffing behavior against PPSSPP, but the code has not had a traditional
@@ -22,10 +24,13 @@ the PSP Graphics Engine to OpenGL 3.3.
 - [Overview](#overview)
 - [Pipeline](#pipeline)
 - [Why Ghidra?](#why-ghidra)
+- [Quickstart](#quickstart)
+- [Supported games](#supported-games)
 - [Current Status](#current-status)
 - [Building and Running](#building-and-running)
 - [Verification Methodology](#verification-methodology)
 - [Limitations](#limitations)
+- [Documentation](#documentation)
 - [Reference Projects](#reference-projects)
 - [License](#license)
 
@@ -89,7 +94,63 @@ Two things follow from this design:
 The PSP's CPU (Allegrex) is a MIPS32 variant with custom instructions and a vector unit (VFPU)
 that stock Ghidra does not understand, so the
 [ghidra-allegrex](https://github.com/kotcrab/ghidra-allegrex) processor extension is required —
-see [Prerequisites](#prerequisites-macos--homebrew).
+see [Prerequisites](#prerequisites).
+
+## Quickstart
+
+This is the exact sequence that produces the verified Patapon title screen on macOS. It assumes
+you have installed the [prerequisites](#prerequisites) (including the pinned Ghidra +
+ghidra-allegrex combo) and have your own `BOOT.BIN` and extracted `disc0/` (no game data ships
+with this repo).
+
+```bash
+# 0. Fetch the PSP NID database (once per clone; NOT committed — issue #53).
+#    Maps firmware NIDs to SDK names so analyze can resolve import stubs.
+./scripts/fetch-niddb.sh
+
+# 1. Build the Rust pipeline.
+cargo build --release
+
+# 2. Analyze BOOT.BIN -> analysis.json (Ghidra headless; once per binary).
+#    On a Homebrew Ghidra, --ghidra-dir is the install's libexec/.
+cargo run --release -- analyze \
+    --ghidra-dir "$(brew --prefix ghidra)/libexec" BOOT.BIN
+
+# 3. Generate C++17 from analysis.json. PSPRECOMP_CROSS_MID=1 is required;
+#    --config selects Patapon's manifest (force entries + per-game choices);
+#    the --expect-* flags fail the build if the census drifts from the
+#    verified Patapon baseline.
+PSPRECOMP_CROSS_MID=1 cargo run --release -- recompile analysis.json \
+    --config games/patapon/game.toml -o output \
+    --expect-functions 14104 --expect-mid-entries 2022
+
+# 4. Build the runtime (PSPRECOMP_GAME defaults to "patapon").
+cmake -B runtime/build -S runtime \
+    && cmake --build runtime/build -j$(sysctl -n hw.ncpu)
+
+# 5. Run (the configuration the title screen was verified under).
+PSPRECOMP_CROSS_MID=1 PSPRECOMP_CLEANROOM=1 ./runtime/build/psprecomp_runtime
+```
+
+The `--expect-functions`/`--expect-mid-entries` values are the Patapon baseline (14,104 / 2,022).
+For a different binary, drop them or set them to that binary's expected census. Full prerequisite
+and flag detail is in [Building and Running](#building-and-running); every environment variable is
+catalogued in [docs/ENV_FLAGS.md](docs/ENV_FLAGS.md).
+
+## Supported games
+
+The recompiler core (decoder, emitter, runtime) is game-agnostic; per-game code is isolated under
+`games/<id>/`. "Verified" below means actually driven to the stated behavior and checked against
+PPSSPP — not "should work."
+
+| Game | Status | Notes |
+|------|--------|-------|
+| **Patapon (USA)** — `BOOT.BIN`, UCUS-98643 | Boots + renders title screen (verified, macOS) | The reference title. Recompiles to 14,104 functions / 2,022 mid-entries; reaches the PATAPON logo + NEW GAME/CONTINUE menu. Gameplay beyond the title screen is unexplored. |
+| **.hack//Link** — ULJS-00266 | Recompiles + links + boots, no graphics (in progress) | A second commercial binary. Recompiles against the generic runtime (`-DPSPRECOMP_GAME=none`), boots through `module_start`, and runs its main thread, but produces no frames yet. Config-only so far (`games/dothack/game.toml`); bring-up is ongoing. |
+
+The single platform is macOS — see [Limitations](#limitations) and
+[docs/PLATFORMS.md](docs/PLATFORMS.md). To bring up another title, see
+[docs/ADDING_A_GAME.md](docs/ADDING_A_GAME.md).
 
 ## Current Status
 
@@ -114,18 +175,61 @@ Recent work that got it there (merged via PR #17):
 
 ## Building and Running
 
-### Prerequisites (macOS / Homebrew)
+### Prerequisites
+
+Build toolchain (macOS / Homebrew):
 
 ```bash
-brew install cmake sdl2 pkg-config ghidra
+brew install cmake sdl2 pkg-config
 ```
 
 - **Rust** (stable) and a **C++17 compiler**; CMake 3.16+, SDL2 (found via pkg-config), OpenGL 3.3.
-- **Ghidra 12.x** — used by the `analyze` step only (see [Why Ghidra?](#why-ghidra)).
-- **[ghidra-allegrex](https://github.com/kotcrab/ghidra-allegrex)** — Ghidra processor extension
-  for the PSP's Allegrex CPU. Install it into your Ghidra (Ghidra GUI: *File → Install
-  Extensions*, or unzip into the install dir); the analyze step verifies that
-  `<ghidra-install>/Ghidra/Processors/Allegrex` exists and refuses to run without it.
+
+#### Ghidra (for the `analyze` step only)
+
+`analyze` runs Ghidra headless once per binary; `recompile` and the runtime never touch Ghidra.
+Ghidra extensions are version-locked to a specific Ghidra patch, so use this exact, tested
+combination:
+
+| Component | Pinned version |
+|-----------|----------------|
+| Ghidra | **12.0.2 PUBLIC** (requires JDK 21) |
+| [ghidra-allegrex](https://github.com/kotcrab/ghidra-allegrex) extension | **v21.3**, asset `ghidra_12.0.2_PUBLIC_20260310_ghidra-allegrex.zip` |
+
+The ghidra-allegrex extension supplies the PSP Allegrex/VFPU instruction semantics and the
+`PspElfLoader` the pipeline depends on (stock Ghidra understands neither). The extension
+version-locks to the exact Ghidra patch — **match the asset name to your Ghidra
+`application.version` 1:1**. v21.3 ships per-patch builds (`12.0`, `12.0.1`, `12.0.2`, `12.0.3`,
+`12.0.4`, `12.1`); v21.2 and earlier do **not** support any Ghidra 12.x.
+
+> [!WARNING]
+> `brew install ghidra` currently lands a **newer** Ghidra (12.1.2 at time of writing), not the
+> pinned 12.0.2. If you take the newer one, you must use the matching v21.3 `12.1` extension asset
+> and re-verify. To stay on the tested combo, install Ghidra 12.0.2 directly (below).
+
+Install Ghidra 12.0.2 and the matching extension:
+
+```bash
+# 1. Install Ghidra 12.0.2 PUBLIC.
+#    macOS: download ghidra_12.0.2_PUBLIC from the official releases page and unzip, OR
+#    `brew install ghidra` (then confirm the version below — brew may give 12.1.x).
+#    Linux: download + unzip ghidra_12.0.2_PUBLIC, set GHIDRA_INSTALL_DIR.
+#      https://github.com/NationalSecurityAgency/ghidra/releases
+GHIDRA_DIR="$(brew --prefix ghidra)/libexec"   # Homebrew; on a manual unzip use the unzip dir
+grep application.version "$GHIDRA_DIR/Ghidra/application.properties"   # confirm 12.0.2
+
+# 2. Download the matching ghidra-allegrex extension (v21.3, 12.0.2 asset).
+#    If step 1 gave a different 12.0.x/12.1, swap the asset name to match.
+curl -L -o /tmp/allegrex.zip \
+  https://github.com/kotcrab/ghidra-allegrex/releases/download/v21.3/ghidra_12.0.2_PUBLIC_20260310_ghidra-allegrex.zip
+
+# 3. Install it: Ghidra GUI -> File -> Install Extensions -> "+" -> select the zip -> restart.
+#    (Or unzip into "$GHIDRA_DIR/Ghidra/Extensions/" and restart.)
+```
+
+The analyze step verifies the Allegrex processor module is present and refuses to run without it.
+Pass the install to `analyze` with `--ghidra-dir` (Homebrew: `"$(brew --prefix ghidra)/libexec"`;
+manual unzip: the directory containing `support/analyzeHeadless`, with no `libexec`).
 
 You must also provide, from your own copy of the game (no game data is included in or
 distributed with this repository):
@@ -135,7 +239,7 @@ distributed with this repository):
 
 The `analyze` step also needs the PSP NID database (`data/niddb/ppsspp_niddb.xml`), which
 maps firmware function NIDs to names. It is not committed (PPSSPP-derived; `data/` is
-gitignored). Fetch it once after cloning:
+gitignored — issue #53). Fetch it once after cloning:
 
 ```bash
 ./scripts/fetch-niddb.sh
@@ -159,9 +263,11 @@ cargo test
 cargo run --release -- analyze --ghidra-dir "$(brew --prefix ghidra)/libexec" BOOT.BIN
 
 # 3. Generate C++ source from analysis.json (PSPRECOMP_CROSS_MID=1 is required;
-#    --config selects the per-game manifest — Patapon's carries its force entries)
+#    --config selects the per-game manifest — Patapon's carries its force entries;
+#    --expect-* fail the build if the census drifts from the Patapon baseline)
 PSPRECOMP_CROSS_MID=1 cargo run --release -- recompile analysis.json \
-    --config games/patapon/game.toml -o output
+    --config games/patapon/game.toml -o output \
+    --expect-functions 14104 --expect-mid-entries 2022
 
 # 4. Build the runtime (PSPRECOMP_GAME selects the games/<id>/ hook module;
 #    defaults to "patapon". -DPSPRECOMP_GAME=none builds a pure generic
@@ -172,7 +278,7 @@ cmake -B runtime/build -S runtime && cmake --build runtime/build -j$(sysctl -n h
 PSPRECOMP_CROSS_MID=1 PSPRECOMP_CLEANROOM=1 ./runtime/build/psprecomp_runtime
 ```
 
-Useful environment variables:
+The most commonly used environment variables:
 
 | Variable | Effect |
 |----------|--------|
@@ -180,6 +286,10 @@ Useful environment variables:
 | `PSPRECOMP_CLEANROOM=1` | Faithful HLE pass-throughs instead of legacy debug wrappers; the standard verification configuration |
 | `PSPRECOMP_DISC0=/path` | Extracted ISO content directory (default `./disc0`) |
 | `PSPRECOMP_STRICT=1` | Abort on dispatch-table miss (debugging) |
+
+The full set of environment variables is catalogued in [docs/ENV_FLAGS.md](docs/ENV_FLAGS.md).
+If a step fails (missing NID database, Ghidra/extension mismatch, stale `output/`, a black
+window), see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 Inspect the emitted C++ for a single function:
 
@@ -219,7 +329,22 @@ checked with adversarial sub-agent verification before they are banked.
   Developed and tested on macOS only; Linux and Windows have never been tried (the build
   assumes SDL2 via pkg-config and OpenGL 3.3, and the render-queue threading model was
   designed around macOS constraints). Testing and supporting other operating systems is a
-  to-do. Optimizer passes are disabled by design until a later phase.
+  to-do — see [docs/PLATFORMS.md](docs/PLATFORMS.md). Optimizer passes are disabled by design
+  until a later phase. Per-game render coverage is summarized in
+  [Supported games](#supported-games).
+
+## Documentation
+
+| Document | Covers |
+|----------|--------|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Structural reference: crates, generated output layout, per-game layer, runtime subsystems, data flow, invariants |
+| [DEBUGGING.md](DEBUGGING.md) | Debugging methodology: triage by symptom, lldb recipes, oracle-driven differential method, verification gates, known failure patterns |
+| [docs/GRAPHICS.md](docs/GRAPHICS.md) | How the runtime translates the PSP Graphics Engine to OpenGL 3.3 |
+| [docs/SCHEDULER-DESIGN.md](docs/SCHEDULER-DESIGN.md) | Cooperative thread scheduler design |
+| [docs/ENV_FLAGS.md](docs/ENV_FLAGS.md) | Complete catalogue of environment variables |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common setup and runtime errors and their fixes |
+| [docs/ADDING_A_GAME.md](docs/ADDING_A_GAME.md) | Bringing up a new title against the generic runtime |
+| [docs/PLATFORMS.md](docs/PLATFORMS.md) | Platform support status and porting notes |
 
 ## Reference Projects
 
