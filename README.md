@@ -147,7 +147,11 @@ PPSSPP — not "should work."
 | Game | Status | Notes |
 |------|--------|-------|
 | **Patapon (USA)** — `BOOT.BIN`, UCUS-98643 | Boots + renders title screen (verified, macOS) | The reference title. Recompiles to 14,104 functions / 2,022 mid-entries; reaches the PATAPON logo + NEW GAME/CONTINUE menu. Gameplay beyond the title screen is unexplored. |
-| **.hack//Link** — ULJS-00266 | Recompiles + links + boots, no graphics (in progress) | A second commercial binary. Recompiles against the generic runtime (`-DPSPRECOMP_GAME=none`), boots through `module_start`, and runs its main thread, but produces no frames yet. Config-only so far (`games/dothack/game.toml`); bring-up is ongoing. |
+| **.hack//Link** — ULJS-00266 | Boots + draws its loading screen (in progress) | A second commercial binary, recompiled against the generic runtime (`-DPSPRECOMP_GAME=none`) with no per-game runtime code. Boots through `module_start`, runs its main thread, and reaches the GE render loop — drawing its in-game loading panel (shown below). The real menu/scene is still gated behind a loading-progression wall (#63), and boots are not yet deterministic. Config-only so far (`games/dothack/game.toml`). |
+
+![.hack//Link (ULJS-00266) loading screen rendered by psprecomp_runtime](docs/dothack-render.png)
+
+*Second game in the generic runtime: `.hack//Link` boots and reaches its render loop, drawing its loading panel — no Patapon-specific code involved. Full menu/scene rendering is still in progress ([#63](https://github.com/wizardengineer/psprecomp/issues/63)).*
 
 The single platform is macOS — see [Limitations](#limitations) and
 [docs/PLATFORMS.md](docs/PLATFORMS.md). To bring up another title, see
@@ -364,12 +368,13 @@ checked with adversarial sub-agent verification before they are banked.
   game's state machine) has not yet been exercised in our runtime.
 - **A rare race** in the game's IO worker (a phantom job, roughly 1 in 20 boots) is tripwired but
   not fixed.
-- **One game renders, single platform.** Patapon BOOT.BIN is the only title that reaches
-  graphics. The runtime core itself is now game-agnostic — all Patapon-specific code lives in
-  `games/patapon/` behind compile-time seams, enforced by `runtime/tools/purity_gate.sh`
+- **One game playable-bound, single platform.** Patapon is the only title driven to a complete
+  rendered screen. The runtime core itself is now game-agnostic — all Patapon-specific code lives
+  in `games/patapon/` behind compile-time seams, enforced by `runtime/tools/purity_gate.sh`
   (no game literals or symbols in core objects) — and a second commercial binary recompiles,
-  links against the generic runtime (`-DPSPRECOMP_GAME=none`), boots through `module_start`,
-  and runs its main thread, but produces no graphics yet (bring-up is the next phase).
+  links against the generic runtime (`-DPSPRECOMP_GAME=none`), boots through `module_start`, runs
+  its main thread, and reaches the GE render loop drawing its loading screen, but has not rendered
+  its real menu/scene yet (bring-up is ongoing — see [Supported games](#supported-games)).
   Type-B (0x700000A1) packed relocations are detected and rejected with an explicit error.
   Developed and tested on macOS only; Linux and Windows have never been tried (the build
   assumes SDL2 via pkg-config and OpenGL 3.3, and the render-queue threading model was
