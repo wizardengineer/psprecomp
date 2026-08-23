@@ -414,3 +414,7 @@ which is licensed GPL-2.0-or-later.
 Bundled third-party loaders (`runtime/src/glad.c`, `runtime/include/glad/`,
 `runtime/include/KHR/khrplatform.h`) carry their own permissive licenses, noted in their
 file headers.
+
+## Build flags
+
+See [docs/build-flags.md](docs/build-flags.md) for the consolidated `PSPRECOMP_*` flag reference.
